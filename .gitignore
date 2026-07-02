@@ -1,0 +1,40 @@
+# Vagrant
+.vagrant/
+*.box
+Vagrantfile.local
+
+# Packer build artifacts
+packer/*/builds/
+packer/*/boxes/*.box
+
+# ISO files - never commit these
+iso/*.iso
+*.iso
+*.img
+
+# VM artifacts
+*.ova
+*.ovf
+*.vmdk
+*.vhd
+*.vhdx
+
+# Logs
+*.log
+packer-manifest.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Keep directory structure
+!bin/.gitkeep
+!assets/.gitkeep
+!iso/.gitkeep
