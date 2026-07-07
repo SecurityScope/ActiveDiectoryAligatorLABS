@@ -4,8 +4,8 @@
 Vagrantfile.local
 
 # Packer build artifacts
-packer/*/builds/
-packer/*/boxes/*.box
+packer/builds/
+packer/boxes/*.box
 
 # ISO files - never commit these
 iso/*.iso
@@ -38,3 +38,11 @@ desktop.ini
 !bin/.gitkeep
 !assets/.gitkeep
 !iso/.gitkeep
+!packer/boxes/.gitkeep
+!packer/builds/.gitkeep
+
+# Dev documentation (internal only)
+doc/
+
+# Temp directory
+/temp

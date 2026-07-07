@@ -17,15 +17,15 @@ Stop-Service wuauserv -ErrorAction SilentlyContinue
 
 Write-Host "[common] Setting network profiles to Private..."
 $profileSet = $false
-for ($i = 1; $i -le 12; $i++) {
+for ($i = 1; $i -le 8; $i++) {
     try {
         Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction Stop
         Write-Host "[common] Network profiles set to Private"
         $profileSet = $true
         break
     } catch {
-        Write-Host "[common] Waiting for network profiles... attempt $i/12"
-        Start-Sleep 10
+        Write-Host "[common] Waiting for network profiles... attempt $i/8"
+        Start-Sleep 5
     }
 }
 if (-not $profileSet) {
@@ -51,5 +51,8 @@ try {
 } catch {
     try { Set-TimeZone -Name "UTC" -ErrorAction Stop } catch {}
 }
+
+Write-Host "[common] Ensuring AD Web Services available..."
+Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
 
 Write-Host "[common] Done"

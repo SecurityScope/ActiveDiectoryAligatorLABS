@@ -1,5 +1,5 @@
 # Auto-install required plugins
-required_plugins = %w[vagrant-reload vagrant-vbguest vagrant-hostmanager vagrant-winrm-syncedfolders]
+required_plugins = %w[vagrant-reload vagrant-vbguest vagrant-hostmanager]
 plugins_to_install = required_plugins.reject { |p| Vagrant.has_plugin?(p) }
 unless plugins_to_install.empty?
   puts "Installing required plugins: #{plugins_to_install.join(', ')}"
@@ -32,14 +32,36 @@ KALI_IP       = "192.168.200.99"
 ADMIN_PASS    = "SecScope2024!"
 DSRM_PASS     = "DsrmPass2024!"
 
+# Domain Controllers (dc01, dc02, dc03) lose their local SAM database once
+# they are promoted (Install-ADDSForest / Install-ADDSDomainController) -
+# only domain accounts authenticate afterward, so the WinRM communicator
+# must use "Administrator" instead of the local "vagrant" account for
+# those three machines. The built-in Administrator account survives
+# promotion with the SAME password it had locally (set to "vagrant" by
+# Autounattend.xml), until dc01_dns.ps1 resets it to ADMIN_PASS as part of
+# the documented setup.sh flow. Anything driving `vagrant provision` /
+# `vagrant up` for a DC AFTER that password reset has happened (i.e. every
+# step from "objects-base" onward, and any subsequent `vagrant up` once
+# the lab is fully built) must set DC_WINRM_PASSWORD=SecScope2024! in the
+# environment - setup.sh does this automatically.
+DC_WINRM_PASSWORD = ENV['DC_WINRM_PASSWORD'] || "vagrant"
+
+SERVER_BOX      = "secscope/windows-server-2022"
+WORKSTATION_BOX = "secscope/windows-10"
+
 # ─── Helper: define a Windows VM with common boilerplate ─────────────────
 
-def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: "gusztavvargadr/windows-server-2022-standard", rdp_port: nil, winrm_port: nil)
+def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: SERVER_BOX, rdp_port: nil, winrm_port: nil, domain_controller: false)
   config.vm.define name do |vm|
     vm.vm.box = box
     vm.vm.communicator = "winrm"
-    vm.winrm.username = "vagrant"
-    vm.winrm.password = "vagrant"
+    if domain_controller
+      vm.winrm.username = "Administrator"
+      vm.winrm.password = DC_WINRM_PASSWORD
+    else
+      vm.winrm.username = "vagrant"
+      vm.winrm.password = "vagrant"
+    end
 
     if rdp_port
       vm.vm.network "forwarded_port", guest: 3389, host: rdp_port, auto_correct: true
@@ -54,11 +76,16 @@ def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: "gusztavva
       v.cpus = cpus
       v.customize ["modifyvm", :id, "--name", "#{name.upcase}.SECSCOPE.CORP"]
       v.customize ["modifyvm", :id, "--vram", "128"]
-      v.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
-      v.customize ["modifyvm", :id, "--accelerate3d", "on"]
+      v.customize ["modifyvm", :id, "--graphicscontroller", "vboxsvga"]
+      v.customize ["modifyvm", :id, "--accelerate3d", "off"]
       v.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
       v.customize ["modifyvm", :id, "--nic2", "natnetwork"]
       v.customize ["modifyvm", :id, "--nat-network2", "SECSCOPE.CORP"]
+      # Boxes built by Packer boot from DVD (needed for OS install) and that
+      # boot order is baked into the exported box. Force disk-first boot here
+      # so VMs don't fail with "Could not read from the boot medium!".
+      v.customize ["modifyvm", :id, "--boot1", "disk"]
+      v.customize ["modifyvm", :id, "--boot2", "none"]
     end
 
     vm.vm.provision "common", type: "shell", path: "scripts/common_windows.ps1"
@@ -72,9 +99,10 @@ end
 
 Vagrant.configure("2") do |config|
 
-  config.vm.boot_timeout = 900
-  config.winrm.timeout   = 1800
+  config.vm.boot_timeout = 300
+  config.winrm.timeout   = 180
   config.winrm.retry_limit = 30
+  config.winrm.retry_delay = 10
 
   config.hostmanager.enabled = true
   config.hostmanager.manage_host = false   # false: do NOT edit host OS hosts file (UAC on Windows, permissions on Linux/macOS)
@@ -96,7 +124,7 @@ Vagrant.configure("2") do |config|
 
   # ─── DC01 ─── Primary Domain Controller ──────────────────────────────────
 
-  define_windows_vm(config, name: "dc01", ip: DC01_IP) do |vm|
+  define_windows_vm(config, name: "dc01", ip: DC01_IP, rdp_port: 33889, winrm_port: 59849, domain_controller: true) do |vm|
     vm.vm.provision "base", type: "shell", path: "scripts/dc_base.ps1", env: {
       "DC_IP"      => DC01_IP,
       "DC01_IP"    => DC01_IP,
@@ -104,6 +132,9 @@ Vagrant.configure("2") do |config|
       "LOG_PREFIX" => "dc01_base",
       "DNS_SERVER" => "127.0.0.1"
     }
+
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
 
     vm.vm.provision "base-reload", type: :reload
 
@@ -155,7 +186,10 @@ Vagrant.configure("2") do |config|
 
   # ─── DC02 ─── Secondary Domain Controller ─────────────────────────────────
 
-  define_windows_vm(config, name: "dc02", ip: DC02_IP, rdp_port: 33890, winrm_port: 59850) do |vm|
+  define_windows_vm(config, name: "dc02", ip: DC02_IP, rdp_port: 33890, winrm_port: 59850, domain_controller: true) do |vm|
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
+
     vm.vm.provision "base", type: "shell", path: "scripts/dc_base.ps1", env: {
       "DC_IP"      => DC02_IP,
       "DC01_IP"    => DC01_IP,
@@ -167,9 +201,10 @@ Vagrant.configure("2") do |config|
 
     vm.vm.provision "join", type: "shell", run: "never",
       path: "scripts/dc02_join.ps1", env: {
-        "DOMAIN"     => DOMAIN,
-        "ADMIN_PASS" => ADMIN_PASS,
-        "DC01_IP"    => DC01_IP
+        "DOMAIN"       => DOMAIN,
+        "DOMAIN_UPPER" => DOMAIN_UPPER,
+        "ADMIN_PASS"   => ADMIN_PASS,
+        "DC01_IP"      => DC01_IP
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
@@ -177,12 +212,16 @@ Vagrant.configure("2") do |config|
 
   # ─── DC03 ─── Subdomain Controller (it.secscope.corp) ──────────────
 
-  define_windows_vm(config, name: "dc03", ip: DC03_IP, rdp_port: 33891, winrm_port: 59851) do |vm|
+  define_windows_vm(config, name: "dc03", ip: DC03_IP, rdp_port: 33891, winrm_port: 59851, domain_controller: true) do |vm|
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
+
     vm.vm.provision "base", type: "shell", path: "scripts/dc_base.ps1", env: {
       "DC_IP"      => DC03_IP,
       "DC01_IP"    => DC01_IP,
       "DC_NAME"    => "DC03",
-      "LOG_PREFIX" => "dc03_base"
+      "LOG_PREFIX" => "dc03_base",
+      "DNSSUFFIX"  => "it.secscope.corp"
     }
 
     vm.vm.provision "base-reload", type: :reload
@@ -202,6 +241,9 @@ Vagrant.configure("2") do |config|
   # ─── SRV01 ─── MSSQL + IIS + ADCS CA ─────────────────────────────────────
 
   define_windows_vm(config, name: "srv01", ip: SRV01_IP, memory: 3072, rdp_port: 33892, winrm_port: 59852) do |vm|
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
+
     vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,
@@ -223,7 +265,10 @@ Vagrant.configure("2") do |config|
 
   # ─── WS01 ─── Domain Workstation, Primary Pivot Target ────────────────────
 
-  define_windows_vm(config, name: "ws01", ip: WS01_IP, box: "gusztavvargadr/windows-10-22h2-enterprise", rdp_port: 53389, winrm_port: 55985) do |vm|
+  define_windows_vm(config, name: "ws01", ip: WS01_IP, box: WORKSTATION_BOX, rdp_port: 53389, winrm_port: 55987) do |vm|
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
+
     vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,
@@ -244,7 +289,10 @@ Vagrant.configure("2") do |config|
 
   # ─── WS02 ─── Domain Workstation, Unconstrained Delegation ────────────────
 
-  define_windows_vm(config, name: "ws02", ip: WS02_IP, box: "gusztavvargadr/windows-10-22h2-enterprise", rdp_port: 53390, winrm_port: 55986) do |vm|
+  define_windows_vm(config, name: "ws02", ip: WS02_IP, box: WORKSTATION_BOX, rdp_port: 53390, winrm_port: 55988) do |vm|
+    vm.vm.provision "sysprep", type: "shell", run: "never",
+      path: "scripts/sysprep_sid.ps1"
+
     vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,

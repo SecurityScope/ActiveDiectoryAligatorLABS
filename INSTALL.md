@@ -1,6 +1,6 @@
 # Active Directory Alligator Labs — Installation Guide
 
-Step-by-step instructions to go from zero to a fully working Active Directory penetration testing lab.
+Step-by-step instructions to go from zero to a fully working Active Directory lab.
 
 ## Pre-Installation Checklist
 
@@ -34,8 +34,8 @@ Step-by-step instructions to go from zero to a fully working Active Directory pe
 
 4. Verify from **PowerShell (Admin)**:
    ```powershell
-    vagrant --version          # must be >= 2.3.0
-    VBoxManage --version       # must be >= 7.0
+   vagrant --version          # must be >= 2.3.0
+   VBoxManage --version       # must be >= 7.0
    ```
 
 > **Hyper-V conflict:** If Vagrant fails to start VMs, disable Hyper-V, Windows Sandbox, and WSL2:
@@ -72,7 +72,6 @@ Step-by-step instructions to go from zero to a fully working Active Directory pe
 
 1. **VirtualBox 7.0+** (from Oracle, not the distro package):
    ```bash
-   # Add Oracle VirtualBox repo
    wget -q https://www.virtualbox.org/download/oracle_vbox_2016.asc -O- | sudo apt-key add -
    sudo add-apt-repository "deb [arch=amd64] https://download.virtualbox.org/virtualbox/debian $(lsb_release -cs) contrib"
    sudo apt-get update
@@ -125,9 +124,9 @@ Step-by-step instructions to go from zero to a fully working Active Directory pe
 | Linux | `egrep -c '(vmx|svm)' /proc/cpuinfo` — if 0, enable VT-x/AMD-V in BIOS |
 
 > **Windows evaluation period:** Both Windows Server 2022 and Windows 10
-> Enterprise boxes are evaluation copies valid for **180 days**. After
-> expiration, Windows shuts down every hour. Check inside the VM:
-> `slmgr /dli`. Rearm (up to 3 times): `slmgr /rearm`.
+> boxes are evaluation copies valid for **180 days**. After expiration,
+> Windows shuts down every hour. Check inside the VM: `slmgr /dli`.
+> Rearm (up to 3 times): `slmgr /rearm`.
 
 ---
 
@@ -142,24 +141,56 @@ Or download and extract the ZIP into a directory called `ActiveDirectoryAlligato
 
 ---
 
-## 4. Build Vagrant Boxes (Required)
+## 4. Build Vagrant Boxes
 
-The lab uses custom Packer-built boxes. Download Windows ISOs (see `packer/ISO_INSTRUCTIONS.md`), then build:
+Windows boxes must be built from ISO before any VMs can be started.
+
+### Download ISOs
+
+| ISO | Download | Expected Filename | SHA256 |
+|-----|----------|-------------------|--------|
+| Windows Server 2022 | [Direct download](https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso) | `SERVER_EVAL_x64FRE_en-us.iso` | `3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325` |
+| Windows 10 22H2 | [Download page](https://www.microsoft.com/en-us/software-download/windows10ISO) | `Win10_22H2_English_x64v1.iso` | `a6f470ca6d331eb353b815c043e327a347f594f37ff525f17764738fe812852e` |
+
+Download the ISOs, rename them to match the expected filenames above, and place them
+in the `iso/` directory. Verify the checksums match:
+
+**Linux/macOS:**
+```bash
+sha256sum iso/SERVER_EVAL_x64FRE_en-us.iso
+sha256sum iso/Win10_22H2_English_x64v1.iso
+```
+
+**Windows PowerShell:**
+```powershell
+Get-FileHash -Algorithm SHA256 iso\SERVER_EVAL_x64FRE_en-us.iso
+Get-FileHash -Algorithm SHA256 iso\Win10_22H2_English_x64v1.iso
+```
+
+> Microsoft may update the ISO builds over time. If your checksum does not match the
+> values above, you may have a newer build — adjust the `iso_checksum` variable in
+> the Packer `.pkr.hcl` files, or pass it as a variable (`-var "iso_checksum=..."`).
+
+### Build Boxes
+
+Build the Windows boxes sequentially:
 
 ```bash
-# Download ISOs — see packer/ISO_INSTRUCTIONS.md
-# Place ISOs in the iso/ directory
-
 # Build Windows Server 2022 box (~45-90 minutes)
-./build-boxes.sh --server-only
+./setup.sh build-boxes --server-only
 
-# Build Windows 10 Enterprise box (~45-90 minutes)
-./build-boxes.sh --workstation-only
+# Build Windows 10 box (~45-90 minutes)
+./setup.sh build-boxes --workstation-only
 ```
 
 Or build both at once:
 ```bash
-./build-boxes.sh
+./setup.sh build-boxes
+```
+
+**Windows PowerShell:**
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1 build-boxes
 ```
 
 Verify boxes:
@@ -167,22 +198,19 @@ Verify boxes:
 vagrant box list | grep secscope
 ```
 
-Should show `secscope/windows-server-2022` and `secscope/windows-10-enterprise`.
-Debian (`debian/bookworm64`) for lin01 is downloaded automatically from Vagrant Cloud on first `vagrant up`.
-
-Expected output:
+Should show:
 ```
-debian/bookworm64                  (virtualbox, 12.x.x)
-secscope/windows-10-enterprise     (virtualbox, x.x.x)
+secscope/windows-10                (virtualbox, x.x.x)
 secscope/windows-server-2022       (virtualbox, x.x.x)
 ```
+
+Debian (`debian/bookworm64`) for lin01 is auto-downloaded from Vagrant Cloud on first `vagrant up`.
+
+If a `vagrant up` fails with "box not found", run `./setup.sh build-boxes` first.
 
 ---
 
 ## 5. Build the Lab
-
-VMs **must** be started in dependency order. Each step must complete before moving to the next.
-Total build time: ~2-3 hours (excluding box downloads).
 
 ### Automated Build (Recommended)
 
@@ -198,201 +226,35 @@ Use the setup script to build the entire lab automatically:
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-The script runs all `vagrant up` and `vagrant provision` commands in dependency order,
-handles the postboot reload automatically, and runs a final objects pass after all VMs are up.
+The script runs all `vagrant up` and `vagrant provision` commands in the correct dependency order,
+handles reloads automatically, runs DC02+DC03 joins in parallel, and performs a final AD objects pass
+after all VMs are up. Total build time: ~75-90 minutes.
 
-### Manual Step-by-Step Build
-
-Follow these steps if you prefer to run each command individually.
-
-### Step 1 — Primary Domain Controller (DC01)
+### Build Options
 
 ```bash
-vagrant up dc01
+# Build only DC01 (test environment)
+./setup.sh deploy --dc01-only
+
+# Deploy specific VMs only
+./setup.sh deploy --vms dc01,ws01,srv01
+
+# Skip certain steps
+./setup.sh deploy --skip-services    # Skip SRV01 IIS/SQL/ADCS
+./setup.sh deploy --skip-misconfig   # Skip WS01/WS02 vulnerabilities
+./setup.sh deploy --skip-hardening   # Skip vagrant account disable
+./setup.sh deploy --skip-linux       # Skip LIN01
 ```
-
-- Renames computer to DC01, sets static IP
-- **Triggers automatic reboot** — Vagrant will wait and reconnect via WinRM
-- Duration: ~10-15 minutes
-
-### Step 2 — DC01 Post-Boot (AD DS Forest Promotion)
-
-```bash
-vagrant provision dc01 --provision-with postboot
-```
-
-- Installs AD DS, DNS Server, RSAT tools
-- Promotes to Domain Controller (forest root: `secscope.corp`)
-- **No reboot is triggered** — `Install-ADDSForest` runs with `-NoRebootOnCompletion:$true`
-- :warning: **EXPECTED ERROR:** A red `WinRM::WinRMAuthorizationError` will appear at the very end. This is cosmetic — the script exited successfully before the error occurred. Ignore it and proceed.
-- Duration: ~10-15 minutes
-
-### Step 3 — DC01 Reload (Mandatory)
-
-```bash
-vagrant reload dc01 --force
-```
-
-- Reboots DC01 to complete the AD DS promotion and start AD services
-- **`--force` is required** — WinRM is dead after promotion; a plain `vagrant reload` will hang
-- **This step is mandatory** — do not skip it
-- Duration: ~5 minutes
-
-### Step 4 — DC01 DNS Configuration
-
-```bash
-vagrant provision dc01 --provision-with dns
-```
-
-- Waits for AD services to be ready
-- Creates DNS forwarder, reverse zone, A records for all lab machines
-- Configures DHCP server and WPAD option
-- Downloads and installs LAPS MSI (if internet available)
-- Duration: ~3-5 minutes
-
-### Step 5 — Secondary Domain Controller (DC02)
-
-```bash
-vagrant up dc02
-```
-
-- Renames to DC02, sets static IP
-- **Triggers automatic reboot**
-- Duration: ~10-15 minutes
-
-### Step 6 — DC02 Domain Join (Promote as Additional DC)
-
-```bash
-vagrant provision dc02 --provision-with join
-```
-
-- Waits for DC01 to be reachable
-- Installs AD DS, DNS Server
-- Promotes as additional domain controller in `secscope.corp`
-- **Triggers automatic reboot**
-- Duration: ~15-20 minutes
-
-### Step 7 — Subdomain Controller (DC03)
-
-```bash
-vagrant up dc03
-```
-
-- Renames to DC03, sets static IP
-- **Triggers automatic reboot**
-- Duration: ~10-15 minutes
-
-### Step 8 — DC03 Domain Join (Subdomain Promotion)
-
-```bash
-vagrant provision dc03 --provision-with join
-```
-
-- Waits for DC01 to be reachable
-- Installs AD DS, DNS Server
-- Promotes as first DC in subdomain `it.secscope.corp`
-- **Triggers automatic reboot**
-- Duration: ~15-20 minutes
-
-### Step 9 — Application Server (SRV01)
-
-```bash
-vagrant up srv01
-```
-
-- Renames to SRV01, sets static IP
-- Waits for DC01, joins domain
-- **Triggers automatic reboot** for domain join
-- Duration: ~20-25 minutes
-
-### Step 10 — Workstation 1 (WS01)
-
-```bash
-vagrant up ws01
-```
-
-- Renames to WS01, sets static IP
-- Waits for DC01, joins domain
-- **Triggers automatic reboot**
-- Duration: ~10-15 minutes
-
-### Step 11 — Workstation 2 (WS02)
-
-```bash
-vagrant up ws02
-```
-
-- Renames to WS02, sets static IP
-- Waits for DC01, joins domain
-- **Triggers automatic reboot**
-- Duration: ~10-15 minutes
-
-### Step 12 — Linux Domain Member (LIN01)
-
-```bash
-vagrant up lin01
-```
-
-- Installs SSSD, realmd, Kerberos packages
-- Joins the domain via `realm join`
-- Configures SSH, plants credentials and keys
-- Duration: ~5-10 minutes
-
-### Step 13 — AD Objects and ACL Misconfigurations
-
-```bash
-vagrant provision dc01 --provision-with objects
-```
-
-- Creates OUs, users, groups, SPNs
-- Applies ACL misconfigurations (WriteDACL, GenericWrite, delegations)
-- Creates GPP cpassword file in SYSVOL
-- Sets weak password policy
-- Duration: ~3-5 minutes
-
-### Step 14 — SRV01 Services
-
-```bash
-vagrant provision srv01 --provision-with services
-```
-
-- Installs IIS web server
-- Attempts SQL Server Express download and installation
-- Enables xp_cmdshell
-- Installs ADCS Enterprise Root CA + Web Enrollment
-- Duration: ~10-15 minutes
-
-### Step 15 — WS01 Misconfigurations
-
-```bash
-vagrant provision ws01 --provision-with misconfig
-```
-
-- Disables SMB signing, enables WDigest, disables LSA protection
-- Enables NTLMv1, LLMNR/mDNS, NetBIOS
-- Creates local admin, plants PowerShell history, scheduled task, service credentials
-- Duration: ~2-3 minutes
-
-### Step 16 — WS02 Misconfigurations
-
-```bash
-vagrant provision ws02 --provision-with misconfig
-```
-
-- Disables SMB signing, enables WDigest
-- Adds anakin to local Administrators
-- Enables Print Spooler service (PrinterBug coercion target)
-- Duration: ~2-3 minutes
 
 ---
 
-## 6. Verify VM Status
+## 6. Verify the Lab
 
 ```bash
-vagrant status
+./setup.sh status
 ```
 
-Expected output — all 7 VMs `running`:
+Expected output — all VMs `running`:
 ```
 dc01    running (virtualbox)
 dc02    running (virtualbox)
@@ -403,7 +265,10 @@ ws02    running (virtualbox)
 lin01   running (virtualbox)
 ```
 
-If any VM shows `poweroff` or `not created`, re-run its `vagrant up` command.
+If any VM shows `poweroff` or `not created`, re-run the build:
+```bash
+./setup.sh
+```
 
 ---
 
@@ -471,6 +336,7 @@ pip3 install bloodhound --quiet
 sudo tee -a /etc/hosts <<EOF
 192.168.200.10  dc01.secscope.corp dc01
 192.168.200.11  dc02.secscope.corp dc02
+192.168.200.12  dc03.secscope.corp dc03 it.secscope.corp
 192.168.200.20  srv01.secscope.corp srv01
 192.168.200.30  ws01.secscope.corp ws01
 192.168.200.31  ws02.secscope.corp ws02
@@ -507,8 +373,7 @@ Run these from the Kali VM to confirm the lab is functional.
 
 ### Basic connectivity
 ```bash
-# Ping all lab VMs
-for ip in 10 11 20 30 31 40; do
+for ip in 10 11 12 20 30 31 40; do
     ping -c 1 192.168.200.$ip && echo "192.168.200.$ip OK" || echo "192.168.200.$ip FAIL"
 done
 ```
@@ -561,11 +426,11 @@ Tools installed automatically on each VM by provisioning scripts:
 |------|--------------------|
 | dc01 | Active Directory Domain Services, DNS Server, RSAT AD PowerShell, LAPS MSI |
 | dc02 | Active Directory Domain Services, DNS Server |
+| dc03 | Active Directory Domain Services, DNS Server |
 | srv01 | IIS Web Server, SQL Server Express (attempted), ADCS Certificate Authority, ADCS Web Enrollment |
-| ws01 | (Intentionally misconfigured: WDigest, NTLMv1, LLMNR/mDNS/NetBIOS, disabled SMB signing/LSA, local admin, scheduled task, service credentials) |
-| ws02 | (Intentionally misconfigured: WDigest, disabled SMB signing, Print Spooler) |
+| ws01 | (Intentionally misconfigured: WDigest, NTLMv1, LLMNR/mDNS/NetBIOS, disabled SMB signing/LSA, local admin, scheduled task, service credentials, AutoLogon as anakin, cached DCC2 creds for anakin+han) |
+| ws02 | (Intentionally misconfigured: WDigest, disabled SMB signing, Print Spooler, AutoLogon as anakin) |
 | lin01 | SSSD, realmd, adcli, Kerberos utilities, Samba, OpenSSH, Python3, nmap |
-| Kali | (Manual install): impacket, responder, bloodhound, neo4j, crackmapexec, evil-winrm, smbclient, hashcat, john, seclists, nmap, netcat |
 
 ---
 
@@ -574,25 +439,11 @@ Tools installed automatically on each VM by provisioning scripts:
 | Stage | Approximate Time |
 |-------|-----------------|
 | Install VirtualBox + Vagrant | 10-15 min |
-| Pre-download boxes | 1-4 hours (internet-dependent) |
-| vagrant up dc01 | 10-15 min |
-| dc01 postboot provision | 10-15 min |
-| vagrant reload dc01 | 5 min |
-| dc01 dns provision | 3-5 min |
-| vagrant up dc02 | 10-15 min |
-| dc02 join provision | 15-20 min |
-| vagrant up dc03 | 10-15 min |
-| dc03 join provision | 15-20 min |
-| vagrant up srv01 | 20-25 min |
-| vagrant up ws01 | 10-15 min |
-| vagrant up ws02 | 10-15 min |
-| vagrant up lin01 | 5-10 min |
-| dc01 objects provision | 3-5 min |
-| srv01 services provision | 10-15 min |
-| ws01 misconfig provision | 2-3 min |
-| ws02 misconfig provision | 2-3 min |
+| Build Windows Server 2022 box | 45-90 min |
+| Build Windows 10 box | 45-90 min |
+| Deploy lab (./setup.sh) | 75-90 min |
 | Kali VM setup | 15-20 min |
-| **Total (excluding downloads)** | **~2-3 hours** |
+| **Total (excluding box builds)** | **~2 hours** |
 
 ---
 
@@ -610,27 +461,19 @@ Reboot. To re-enable: `bcdedit /set hypervisorlaunchtype auto`
 
 Also disable **Windows Sandbox**, **WSL2**, and **Credential Guard** if enabled.
 
-### Vagrant Box Download Fails
-**Symptom:** `An error occurred while downloading the remote file.`
+### Vagrant Box Not Found
+**Symptom:** `The box 'secscope/windows-server-2022' could not be found.`
 
-**Fix:**
-1. Check internet connectivity: `ping 8.8.8.8`
-2. Ensure boxes are built: `./build-boxes.sh` (see section 4 above)
-3. If you need to use a pre-built box, build it from the packer directory:
-   ```bash
-   cd packer/windows-server-2022
-   packer build windows-server-2022.pkr.hcl
-   ```
+**Fix:** Boxes must be built from ISO before running the lab:
+```bash
+./setup.sh build-boxes
+```
 
 ### WinRM Timeout
 **Symptom:** `Timed out while waiting for the machine to boot` or WinRM connection errors.
 
-**Fix:** Windows VMs are slow on first boot. The Vagrantfile sets `boot_timeout = 900` (15 min).
-If you still hit timeouts:
-```bash
-# Increase in Vagrantfile temporarily:
-config.vm.boot_timeout = 1200
-```
+**Fix:** Windows VMs are slow on first boot. The Vagrantfile sets `boot_timeout = 300` (5 min).
+If you still hit timeouts, increase this in the Vagrantfile temporarily.
 
 ### Port Conflicts
 **Symptom:** Vagrant cannot forward WinRM ports (5985, 5986).
@@ -645,17 +488,17 @@ Stop-Service WinRM
 ### NAT Network Already Exists
 **Symptom:** VBoxManage error about an existing NAT Network.
 
-**Fix:** This is harmless. The Vagrantfile trigger handles this automatically
-(on Windows: `& exit 0` suppresses the error; on Linux/macOS: `2>/dev/null` does the same).
+**Fix:** This is harmless. The Vagrantfile trigger handles this automatically.
 If you need to reset it:
 ```bash
 VBoxManage natnetwork remove --netname SECSCOPE.CORP
 ```
 
 ### DC01 Objects Script — "WS01 not found"
-**Symptom:** During objects provisioning, WS01 and WS02 computer objects may not exist yet (VMs not booted).
+**Symptom:** During objects provisioning, WS01 and WS02 computer objects may not exist yet.
 
-**Fix:** The script now gracefully skips computer ACLs for VMs that are absent and prints a clear message. The setup scripts (`setup.sh` / `setup.ps1`) run a final objects pass after all VMs are up. Or re-run manually:
+**Fix:** The script gracefully skips computer ACLs for VMs that are absent and prints a clear message.
+The setup scripts run a final objects pass after all VMs are up. Or re-run manually:
 ```bash
 vagrant provision dc01 --provision-with objects
 ```
@@ -673,31 +516,21 @@ vagrant provision dc01 --provision-with objects
 
 ## 12. Uninstalling / Rebuilding
 
-### Destroy all VMs (keep downloaded boxes)
+### Destroy all VMs (keep boxes)
 ```bash
-vagrant destroy -f
+./setup.sh destroy
 ```
 
 ### Destroy everything including boxes
 ```bash
-vagrant destroy -f
+./setup.sh destroy
 vagrant box remove secscope/windows-server-2022
-vagrant box remove secscope/windows-10-enterprise
+vagrant box remove secscope/windows-10
 vagrant box remove debian/bookworm64
 ```
 
 ### Full rebuild from scratch
 ```bash
-vagrant destroy -f
-vagrant up dc01
-# ... repeat build steps from Section 5
+./setup.sh destroy
+./setup.sh
 ```
-
----
-
-## 13. Next Steps
-
-Once the lab is built and verified:
-- Read `README.md` for the lab topology, credential tables, and intentional vulnerability reference
-- Take snapshots before exercises: `vagrant snapshot save dc01 clean`
-- Begin the Attacking Active Directory course

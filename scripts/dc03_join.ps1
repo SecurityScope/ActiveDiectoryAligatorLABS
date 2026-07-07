@@ -9,45 +9,52 @@ $dc01IP      = $env:DC01_IP
 
 Write-Host "[dc03_join] Waiting for DC01 to be reachable..."
 $reachable = $false
-for ($i = 1; $i -le 20; $i++) {
+for ($i = 1; $i -le 10; $i++) {
     if (Test-Connection $dc01IP -Count 1 -Quiet) {
         $reachable = $true
         Write-Host "[dc03_join] DC01 reachable"
         break
     }
-    Write-Host "[dc03_join] Attempt $i/20, waiting..."
-    Start-Sleep 15
+    Write-Host "[dc03_join] Attempt $i/10, waiting..."
+    Start-Sleep 5
 }
 if (-not $reachable) {
-    Write-Host "[dc03_join] ERROR: DC01 not reachable after 20 attempts"
+    Write-Host "[dc03_join] ERROR: DC01 not reachable after 50s"
     exit 1
 }
 
-Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on all adapters..."
+Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on internal adapter..."
 $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
-foreach ($adapter in $adapters) {
-    Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex `
-        -ServerAddresses $dc01IP
-    Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name)"
+$mgmtNic = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).InterfaceIndex
+$intNic  = $adapters | Where-Object { $_.InterfaceIndex -ne $mgmtNic } | Select-Object -First 1
+if ($intNic) {
+    Set-DnsClientServerAddress -InterfaceIndex $intNic.InterfaceIndex -ServerAddresses $dc01IP
+    Write-Host "[dc03_join] DNS set on internal adapter: $($intNic.Name)"
+} else {
+    Write-Host "[dc03_join] WARNING: Could not find internal adapter, setting DNS on all adapters..."
+    foreach ($adapter in $adapters) {
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
+        Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name)"
+    }
 }
 Clear-DnsClientCache
 Write-Host "[dc03_join] DNS cache flushed"
 
 Write-Host "[dc03_join] Verifying DNS resolution of secscope.corp..."
 $dnsOk = $false
-for ($i = 1; $i -le 12; $i++) {
+for ($i = 1; $i -le 6; $i++) {
     try {
         $resolved = Resolve-DnsName "secscope.corp" -ErrorAction Stop
         Write-Host "[dc03_join] secscope.corp resolved to: $($resolved.IPAddress)"
         $dnsOk = $true
         break
     } catch {
-        Write-Host "[dc03_join] DNS resolution attempt $i/12, waiting..."
-        Start-Sleep 10
+        Write-Host "[dc03_join] DNS resolution attempt $i/6, waiting..."
+        Start-Sleep 3
     }
 }
 if (-not $dnsOk) {
-    Write-Host "[dc03_join] ERROR: Cannot resolve secscope.corp. Check DC01 is running and reachable."
+    Write-Host "[dc03_join] ERROR: Cannot resolve secscope.corp after 18s. Check DC01 is running and reachable."
     exit 1
 }
 
@@ -75,6 +82,20 @@ try {
 Write-Host "[dc03_join] Installing AD-Domain-Services and DNS..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
 
+Write-Host "[dc03_join] Resolving OU name conflict for child domain..."
+try {
+    $conflictingOU = Get-ADOrganizationalUnit -Identity "OU=IT,DC=secscope,DC=corp" -ErrorAction SilentlyContinue
+    if ($conflictingOU) {
+        Write-Host "[dc03_join] Temporarily renaming OU=IT to avoid conflict..."
+        Rename-ADObject -Identity $conflictingOU.DistinguishedName -NewName "IT_TEMP" -ErrorAction Stop
+        Write-Host "[dc03_join] OU renamed to IT_TEMP"
+    }
+} catch { Write-Host "[dc03_join] No OU conflict found" }
+
+Write-Host "[dc03_join] Importing ADDSDeployment module..."
+Import-Module ADDSDeployment -ErrorAction SilentlyContinue
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+
 Write-Host "[dc03_join] Creating subdomain $childDomain under $domain..."
 try {
     $dcRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
@@ -91,48 +112,50 @@ try {
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $dsrmSec = ConvertTo-SecureString $adminPass -AsPlainText -Force
 
-$credFormats = @(
-    "Administrator@$domain",
-    "$env:DOMAIN_UPPER\Administrator",
-    "Administrator"
-)
-
 Write-Host "[dc03_join] Current system time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Host "[dc03_join] Installing subdomain (retry up to 20 times)..."
+Write-Host "[dc03_join] Installing subdomain (retry up to 3 times)..."
 $promoted = $false
-for ($i = 1; $i -le 20; $i++) {
-    foreach ($credFormat in $credFormats) {
-        Write-Host "[dc03_join] Attempt $i/20 -- credential: $credFormat"
-        $cred = New-Object System.Management.Automation.PSCredential($credFormat, $secPass)
-        try {
-            Install-ADDSDomain `
-                -NewDomainName "it" `
-                -ParentDomainName $domain `
-                -DomainType ChildDomain `
-                -Credential $cred `
-                -SafeModeAdministratorPassword $dsrmSec `
-                -SkipPreChecks:$true `
-                -Force `
-                -NoRebootOnCompletion:$true `
-                -ErrorAction Stop
-            $promoted = $true
-            Write-Host "[dc03_join] Subdomain install succeeded with credential: $credFormat"
-            Write-Host "[dc03_join] Setting Administrator password..."
-            net user Administrator $adminPass 2>&1 | Out-Null
-            Write-Host "[dc03_join] Administrator password set"
-            break
-        } catch {
-            Write-Host "[dc03_join] Failed with $credFormat`: $_"
-            Start-Sleep -Seconds 15
-        }
+for ($i = 1; $i -le 3; $i++) {
+    $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+    Write-Host "[dc03_join] Attempt $i/3..."
+    try {
+        Install-ADDSDomain `
+            -NewDomainName "it" `
+            -ParentDomainName $domain `
+            -DomainType ChildDomain `
+            -NewDomainNetbiosName "ITSEC" `
+            -Credential $cred `
+            -SafeModeAdministratorPassword $dsrmSec `
+            -SkipPreChecks:$true `
+            -Force `
+            -NoRebootOnCompletion:$true `
+            -ErrorAction Stop
+        $promoted = $true
+        Write-Host "[dc03_join] Subdomain install succeeded"
+        Write-Host "[dc03_join] Setting Administrator password..."
+        net user Administrator $adminPass 2>&1 | Out-Null
+        Write-Host "[dc03_join] Administrator password set"
+        Write-Host "[dc03_join] OU IT renamed to IT_TEMP for child domain compatibility."
+        break
+    } catch {
+        Write-Host "[dc03_join] Attempt $i/3 failed: $_"
+        Start-Sleep -Seconds 5
     }
-    if ($promoted) { break }
-    Write-Host "[dc03_join] All credential formats failed on attempt $i/20, waiting..."
-    Start-Sleep -Seconds 30
 }
 if (-not $promoted) {
-    Write-Host "[dc03_join] ERROR: Failed to install subdomain after 20 attempts"
+    Write-Host "[dc03_join] ERROR: Failed to install subdomain after 3 attempts"
     exit 1
 }
+
+Write-Host "[dc03_join] Enabling AD Web Services..."
+Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
+Start-Service ADWS -ErrorAction SilentlyContinue
+
+Write-Host "[dc03_join] Disabling IPv6 DNS registration..."
+Get-NetAdapter | ForEach-Object {
+    Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+}
+Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
 
 Write-Host "[dc03_join] Subdomain install completed successfully. Reboot required (vagrant reload dc03)."

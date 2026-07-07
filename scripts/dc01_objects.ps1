@@ -5,7 +5,7 @@ Write-Host "[objects] Starting AD objects creation..."
 
 Write-Host "[objects] Waiting for AD services..."
 $ready = $false
-for ($i = 1; $i -le 24; $i++) {
+for ($i = 1; $i -le 12; $i++) {
     try {
         $null = Get-ADDomain -ErrorAction Stop
         $null = Get-ADDomainController -Discover -ErrorAction Stop
@@ -13,12 +13,12 @@ for ($i = 1; $i -le 24; $i++) {
         Write-Host "[objects] AD services ready (attempt $i)"
         break
     } catch {
-        Write-Host "[objects] Attempt $i/24, waiting..."
-        Start-Sleep 15
+        Write-Host "[objects] Attempt $i/12, waiting..."
+        Start-Sleep 5
     }
 }
 if (-not $ready) {
-    Write-Host "[objects] ERROR: AD Domain Services not found after 24 attempts."
+    Write-Host "[objects] ERROR: AD Domain Services not found after 60s."
     Write-Host "[objects] Did you run 'vagrant reload dc01' after the postboot provisioner?"
     exit 1
 }
@@ -61,6 +61,7 @@ function New-User-IfMissing {
         UserPrincipalName     = "$Name@$domain"
         Path                  = $Path
         AccountPassword       = $secPass
+        ChangePasswordAtLogon = $false
         Enabled               = $true
         Description           = $Description
         PasswordNeverExpires  = $PasswordNeverExpires.IsPresent

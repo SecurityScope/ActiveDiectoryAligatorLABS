@@ -8,17 +8,17 @@ $dc01IP    = $env:DC01_IP
 
 Write-Host "[dc02_join] Waiting for DC01 to be reachable..."
 $reachable = $false
-for ($i = 1; $i -le 20; $i++) {
+for ($i = 1; $i -le 10; $i++) {
     if (Test-Connection $dc01IP -Count 1 -Quiet) {
         $reachable = $true
         Write-Host "[dc02_join] DC01 reachable"
         break
     }
-    Write-Host "[dc02_join] Attempt $i/20, waiting..."
-    Start-Sleep 15
+    Write-Host "[dc02_join] Attempt $i/10, waiting..."
+    Start-Sleep 5
 }
 if (-not $reachable) {
-    Write-Host "[dc02_join] ERROR: DC01 not reachable after 20 attempts"
+    Write-Host "[dc02_join] ERROR: DC01 not reachable after 50s"
     exit 1
 }
 
@@ -55,43 +55,47 @@ try {
     }
 } catch {}
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
-Write-Host "[dc02_join] Promoting to additional DC (retry up to 20 times)..."
+Write-Host "[dc02_join] Promoting to additional DC (retry up to 5 times)..."
 $dsrmSec = ConvertTo-SecureString $adminPass -AsPlainText -Force
 
-$credFormats = @(
-    "Administrator@$domain",
-    "SECSCOPE\Administrator",
-    "Administrator"
-)
-
 $promoted = $false
-for ($i = 1; $i -le 20; $i++) {
-    foreach ($credFormat in $credFormats) {
-        Write-Host "[dc02_join] Attempt $i/20 -- credential: $credFormat"
-        $cred = New-Object System.Management.Automation.PSCredential($credFormat, $secPass)
-        try {
-            Install-ADDSDomainController `
-                -DomainName $domain `
-                -Credential $cred `
-                -SafeModeAdministratorPassword $dsrmSec `
-                -Force `
-                -NoRebootOnCompletion:$true `
-                -ErrorAction Stop
-            $promoted = $true
-            Write-Host "[dc02_join] Promotion succeeded with credential: $credFormat"
-            break
-        } catch {
-            Write-Host "[dc02_join] Failed with $credFormat`: $_"
-            Start-Sleep -Seconds 15
-        }
+for ($i = 1; $i -le 5; $i++) {
+    Write-Host "[dc02_join] Attempt $i/5..."
+    $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+    try {
+        Install-ADDSDomainController `
+            -DomainName $domain `
+            -Credential $cred `
+            -SafeModeAdministratorPassword $dsrmSec `
+            -Force `
+            -NoRebootOnCompletion:$true `
+            -ErrorAction Stop
+        $promoted = $true
+        Write-Host "[dc02_join] Promotion succeeded"
+        break
+    } catch {
+        Write-Host "[dc02_join] Attempt $i/5 failed: $_"
+        Start-Sleep -Seconds 5
     }
-    if ($promoted) { break }
-    Write-Host "[dc02_join] All formats failed on attempt $i/20, waiting..."
-    Start-Sleep -Seconds 30
 }
 if (-not $promoted) {
-    Write-Host "[dc02_join] ERROR: Failed to promote after 20 attempts"
+    Write-Host "[dc02_join] ERROR: Failed to promote after 5 attempts"
     exit 1
 }
+
+Write-Host "[dc02_join] Setting Administrator password..."
+net user Administrator $adminPass 2>&1 | Out-Null
+Write-Host "[dc02_join] Administrator password set"
+
+Write-Host "[dc02_join] Enabling AD Web Services..."
+Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
+Start-Service ADWS -ErrorAction SilentlyContinue
+
+Write-Host "[dc02_join] Disabling IPv6 DNS registration..."
+Get-NetAdapter | ForEach-Object {
+    Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+}
+Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
 
 Write-Host "[dc02_join] Promotion completed. Reboot required (vagrant reload dc02)."

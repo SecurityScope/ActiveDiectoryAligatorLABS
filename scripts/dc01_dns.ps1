@@ -16,7 +16,7 @@ $kaliIP      = $env:KALI_IP
 
 Write-Host "[dc01_dns] Waiting for AD services..."
 $ready = $false
-for ($i = 1; $i -le 24; $i++) {
+for ($i = 1; $i -le 12; $i++) {
     try {
         $null = Get-ADDomain -ErrorAction Stop
         $null = Get-ADDomainController -Discover -ErrorAction Stop
@@ -24,12 +24,12 @@ for ($i = 1; $i -le 24; $i++) {
         Write-Host "[dc01_dns] AD services ready (attempt $i)"
         break
     } catch {
-        Write-Host "[dc01_dns] Attempt $i/24, waiting..."
-        Start-Sleep 15
+        Write-Host "[dc01_dns] Attempt $i/12, waiting..."
+        Start-Sleep 5
     }
 }
 if (-not $ready) {
-    Write-Host "[dc01_dns] ERROR: AD Domain Services not found after 24 attempts."
+    Write-Host "[dc01_dns] ERROR: AD Domain Services not found after 60s."
     Write-Host "[dc01_dns] Did you run 'vagrant reload dc01' after the postboot provisioner?"
 }
 
@@ -50,14 +50,6 @@ try {
     Write-Host "[dc01_dns] DC promotion confirmed"
 } catch {
     Write-Host "[dc01_dns] WARNING: DC verification failed: $_"
-}
-
-Write-Host "[dc01_dns] Granting vagrant Domain Admin rights..."
-try {
-    Add-ADGroupMember -Identity "Domain Admins" -Members "vagrant" -ErrorAction SilentlyContinue
-    Write-Host "[dc01_dns] vagrant added to Domain Admins"
-} catch {
-    Write-Host "[dc01_dns] vagrant may already be in Domain Admins: $_"
 }
 
 Write-Host "[dc01_dns] Setting DNS forwarder..."
@@ -146,6 +138,25 @@ if (Test-Path $lapsLocal) {
         Write-Host "[dc01_dns] LAPS installed from internet"
     } catch {
         Write-Host "[dc01_dns] WARNING: LAPS unavailable. Place LAPS.x64.msi in ActiveDirectoryAlligatorLABS/ folder or download from https://www.microsoft.com/en-us/download/details.aspx?id=46899"
+    }
+}
+
+Write-Host "[dc01_dns] Cleaning up stale NAT IPs from DNS zone..."
+$zone = $domain
+Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
+    $ip = $_.RecordData.IPv4Address.IPAddressToString
+    if ($ip -like "10.0.2.*") {
+        Write-Host "[dc01_dns] Removing stale A record: $($_.HostName) -> $ip"
+        Remove-DnsServerResourceRecord -ZoneName $zone -RRType A -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
+    }
+}
+Write-Host "[dc01_dns] Disabling IPv6 DNS server registration..."
+Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
+Get-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -ErrorAction SilentlyContinue | ForEach-Object {
+    $ip = $_.RecordData.IPv6Address.IPAddressToString
+    if ($ip -like "fd17*") {
+        Write-Host "[dc01_dns] Removing stale AAAA record: $($_.HostName) -> $ip"
+        Remove-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
     }
 }
 
