@@ -31,7 +31,13 @@ for ($i = 1; $i -le 12; $i++) {
 if (-not $ready) {
     Write-Host "[dc01_dns] ERROR: AD Domain Services not found after 60s."
     Write-Host "[dc01_dns] Did you run 'vagrant reload dc01' after the postboot provisioner?"
+    exit 1
 }
+
+Write-Host "[dc01_dns] Triggering network profile re-detection (NLA)..."
+Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 5
+Write-Host "[dc01_dns] Network profiles re-evaluated"
 
 Write-Host "[dc01_dns] Setting Domain Administrator password..."
 try {

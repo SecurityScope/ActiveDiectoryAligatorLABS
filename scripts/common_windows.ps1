@@ -4,6 +4,7 @@ Write-Host "[common] Starting base Windows configuration..."
 
 Write-Host "[common] Setting PowerShell execution policy..."
 Set-ExecutionPolicy Unrestricted -Scope Process -Force *>$null
+Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force *>$null
 
 Write-Host "[common] Disabling Windows Firewall..."
 Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False

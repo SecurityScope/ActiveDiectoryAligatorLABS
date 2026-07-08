@@ -9,11 +9,22 @@ $dsrmPass    = $env:DSRM_PASS
 Write-Host "[dc01_postboot] Installing AD-Domain-Services, DNS, RSAT..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS, RSAT-AD-PowerShell -IncludeManagementTools
 
-try {
-    $null = Get-ADDomain -ErrorAction Stop
-    Write-Host "[dc01_postboot] Domain $domain already exists, skipping promotion"
-    exit 0
-} catch {}
+Write-Host "[dc01_postboot] Waiting for ADWS before domain check..."
+$adwsReady = $false
+for ($i = 1; $i -le 12; $i++) {
+    try {
+        $status = (Get-Service ADWS -ErrorAction Stop).Status
+        if ($status -eq "Running") { $adwsReady = $true; break }
+    } catch {}
+    Start-Sleep 5
+}
+if ($adwsReady) {
+    try {
+        $null = Get-ADDomain -ErrorAction Stop
+        Write-Host "[dc01_postboot] Domain $domain already exists, skipping promotion"
+        exit 0
+    } catch {}
+}
 
 Write-Host "[dc01_postboot] Promoting to Domain Controller ($domain)..."
 
@@ -68,8 +79,11 @@ if ($errContent) {
     Write-Host "[dc01_postboot] STDERR:"
     $errContent | Write-Host
 }
-# Install-ADDSForest with -NoRebootOnCompletion returns 1 on success (reboot required)
-if ($proc.ExitCode -gt 1) {
+if ($proc.ExitCode -ne 0) {
+    if ($errContent -match "Name change pending") {
+        Write-Host "[dc01_postboot] ERROR: Computer rename has not been applied (reboot missing)."
+        Write-Host "[dc01_postboot] Run 'vagrant reload dc01 --force' first, then retry this provisioner."
+    }
     Write-Host "[dc01_postboot] ERROR: Install-ADDSForest exited with code $($proc.ExitCode)"
     exit 1
 }

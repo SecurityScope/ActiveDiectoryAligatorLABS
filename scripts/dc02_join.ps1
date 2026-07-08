@@ -34,7 +34,11 @@ if (-not (Select-String -Path "$env:windir\System32\drivers\etc\hosts" `
 
 Write-Host "[dc02_join] Syncing clock with DC01 ($dc01IP)..."
 try {
-    net time \\$dc01IP /set /y 2>&1 | Out-Null
+    w32tm /resync 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        w32tm /config /syncfromflags:manual /manualpeerlist:$dc01IP 2>&1 | Out-Null
+        w32tm /resync 2>&1 | Out-Null
+    }
     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[dc02_join] Clock synced. Current time: $currentTime"
 } catch {
@@ -48,34 +52,40 @@ Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
 
 Write-Host "[dc02_join] Joining as additional domain controller..."
 try {
-    $dcRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
+    $dcRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
     if ($dcRole -ge 4) {
         Write-Host "[dc02_join] Already a domain controller (role $dcRole), skipping promotion"
         exit 0
     }
 } catch {}
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+Write-Host "[dc02_join] Cleaning up any stale DC02 AD objects..."
+try {
+    $staleComputer = Get-ADComputer -Identity "DC02" -Server $dc01IP -Credential $cred -ErrorAction Stop
+    if ($staleComputer) {
+        Remove-ADObject -Identity $staleComputer.ObjectGUID -Server $dc01IP -Credential $cred -Recursive -Confirm:$false -ErrorAction Stop
+        Write-Host "[dc02_join] Removed stale DC02 AD object and children"
+        Start-Sleep -Seconds 10
+    }
+} catch {
+    Write-Host "[dc02_join] No stale DC02 to clean (this is fine on first run)"
+}
 Write-Host "[dc02_join] Promoting to additional DC (retry up to 5 times)..."
 $dsrmSec = ConvertTo-SecureString $adminPass -AsPlainText -Force
 
 $promoted = $false
+$retryDelays = @(10, 20, 30, 40, 60)
 for ($i = 1; $i -le 5; $i++) {
     Write-Host "[dc02_join] Attempt $i/5..."
-    $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
     try {
-        Install-ADDSDomainController `
-            -DomainName $domain `
-            -Credential $cred `
-            -SafeModeAdministratorPassword $dsrmSec `
-            -Force `
-            -NoRebootOnCompletion:$true `
-            -ErrorAction Stop
+        Install-ADDSDomainController -DomainName $domain -Credential $cred -SafeModeAdministratorPassword $dsrmSec -Force -NoRebootOnCompletion:$true -ErrorAction Stop
         $promoted = $true
         Write-Host "[dc02_join] Promotion succeeded"
         break
     } catch {
         Write-Host "[dc02_join] Attempt $i/5 failed: $_"
-        Start-Sleep -Seconds 5
+        if ($i -lt 5) { Start-Sleep -Seconds $retryDelays[$i-1] }
     }
 }
 if (-not $promoted) {

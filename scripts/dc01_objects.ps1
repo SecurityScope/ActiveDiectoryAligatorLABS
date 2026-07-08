@@ -202,7 +202,11 @@ try {
 # ══════════════════════════════════════════════════════════════════════════
 
 Write-Host "[objects] Setting DoesNotRequirePreAuth on nopreauth..."
-Set-ADAccountControl nopreauth -DoesNotRequirePreAuth $true
+try {
+    Set-ADAccountControl nopreauth -DoesNotRequirePreAuth $true
+} catch {
+    Write-Host "[objects] WARNING: Could not set DoesNotRequirePreAuth on nopreauth: $_"
+}
 
 # ══════════════════════════════════════════════════════════════════════════
 # ACL: han WriteDACL on domain object (enables DCSync setup)

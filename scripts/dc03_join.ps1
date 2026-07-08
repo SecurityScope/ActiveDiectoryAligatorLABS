@@ -70,7 +70,11 @@ if (-not (Select-String -Path "$env:windir\System32\drivers\etc\hosts" `
 
 Write-Host "[dc03_join] Syncing clock with DC01 ($dc01IP)..."
 try {
-    net time \\$dc01IP /set /y 2>&1 | Out-Null
+    w32tm /resync 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        w32tm /config /syncfromflags:manual /manualpeerlist:$dc01IP 2>&1 | Out-Null
+        w32tm /resync 2>&1 | Out-Null
+    }
     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[dc03_join] Clock synced. Current time: $currentTime"
 } catch {
@@ -98,7 +102,7 @@ Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 
 Write-Host "[dc03_join] Creating subdomain $childDomain under $domain..."
 try {
-    $dcRole = (Get-WmiObject Win32_ComputerSystem).DomainRole
+    $dcRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
     if ($dcRole -ge 4) {
         Write-Host "[dc03_join] Already a domain controller (role $dcRole), skipping promotion"
         exit 0
@@ -110,26 +114,26 @@ try {
     exit 0
 } catch {}
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+Write-Host "[dc03_join] Cleaning up any stale DC03 AD objects..."
+try {
+    $staleComputer = Get-ADComputer -Identity "DC03" -Server $dc01IP -Credential $cred -ErrorAction Stop
+    if ($staleComputer) {
+        Remove-ADObject -Identity $staleComputer.ObjectGUID -Server $dc01IP -Credential $cred -Recursive -Confirm:$false -ErrorAction Stop
+        Write-Host "[dc03_join] Removed stale DC03 AD object and children"
+        Start-Sleep -Seconds 10
+    }
+} catch {
+    Write-Host "[dc03_join] No stale DC03 to clean (this is fine on first run)"
+}
+Write-Host "[dc03_join] Installing subdomain (retry up to 5 times)..."
 $dsrmSec = ConvertTo-SecureString $adminPass -AsPlainText -Force
-
-Write-Host "[dc03_join] Current system time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Host "[dc03_join] Installing subdomain (retry up to 3 times)..."
 $promoted = $false
-for ($i = 1; $i -le 3; $i++) {
-    $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
-    Write-Host "[dc03_join] Attempt $i/3..."
+$retryDelays = @(10, 20, 30, 40, 60)
+for ($i = 1; $i -le 5; $i++) {
+    Write-Host "[dc03_join] Attempt $i/5..."
     try {
-        Install-ADDSDomain `
-            -NewDomainName "it" `
-            -ParentDomainName $domain `
-            -DomainType ChildDomain `
-            -NewDomainNetbiosName "ITSEC" `
-            -Credential $cred `
-            -SafeModeAdministratorPassword $dsrmSec `
-            -SkipPreChecks:$true `
-            -Force `
-            -NoRebootOnCompletion:$true `
-            -ErrorAction Stop
+        Install-ADDSDomain -NewDomainName "it" -ParentDomainName $domain -DomainType ChildDomain -NewDomainNetbiosName "ITSEC" -Credential $cred -SafeModeAdministratorPassword $dsrmSec -Force -NoRebootOnCompletion:$true -ErrorAction Stop
         $promoted = $true
         Write-Host "[dc03_join] Subdomain install succeeded"
         Write-Host "[dc03_join] Setting Administrator password..."
@@ -138,12 +142,12 @@ for ($i = 1; $i -le 3; $i++) {
         Write-Host "[dc03_join] OU IT renamed to IT_TEMP for child domain compatibility."
         break
     } catch {
-        Write-Host "[dc03_join] Attempt $i/3 failed: $_"
-        Start-Sleep -Seconds 5
+        Write-Host "[dc03_join] Attempt $i/5 failed: $_"
+        if ($i -lt 5) { Start-Sleep -Seconds $retryDelays[$i-1] }
     }
 }
 if (-not $promoted) {
-    Write-Host "[dc03_join] ERROR: Failed to install subdomain after 3 attempts"
+    Write-Host "[dc03_join] ERROR: Failed to install subdomain after 5 attempts"
     exit 1
 }
 

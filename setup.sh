@@ -361,22 +361,27 @@ step_dc01_postboot() {
     log_verbose "    (WinRM errors during AD DS promotion are expected)"
     run_vagrant vagrant provision dc01 --provision-with postboot
 
+    log_info "Rebooting DC01 to finalize promotion..."
+    vagrant reload dc01 --force
+
     log_info "Polling for AD to initialize..."
     local ready=false
-    for i in $(seq 1 12); do
+    for i in $(seq 1 24); do
         sleep 5
         if vagrant winrm dc01 -c "Get-ADDomain" 2>/dev/null | grep -q "secscope"; then
             log_ok "AD ready after $((i*5))s"
             ready=true
             break
         fi
-        log_verbose "    ... attempt $i/12"
+        log_verbose "    ... attempt $i/24"
     done
     if [ "$ready" = false ]; then
-        log_err "AD did not initialize within 60s"
+        log_err "AD did not initialize within 120s"
         exit 1
     fi
-    vagrant reload dc01 --force
+    log_info "Triggering NLA re-detection on DC01..."
+    vagrant winrm dc01 -c "Restart-Service NlaSvc -Force; Start-Sleep 5" 2>/dev/null || true
+    log_ok "DC01 network profile re-evaluated"
     ensure_adws dc01
     EXECUTED_STEPS+=("DC01 postboot")
 }
@@ -472,14 +477,17 @@ step_dc_joins() {
             SKIPPED_STEPS+=("DC02 join")
         else
             (
-                vagrant provision dc02 --provision-with join 2>&1 | filter_winrm
-                for i in $(seq 1 12); do
-                    sleep 3
-                    if vagrant winrm dc02 -c "Get-ADDomainController" 2>/dev/null | grep -q "DC02"; then
-                        log_ok "DC02 ready after $((i*3))s"
+                vagrant provision dc02 --provision-with join 2>&1 | filter_winrm || true
+                vagrant reload dc02 --force
+                for i in $(seq 1 24); do
+                    sleep 5
+                    if vagrant winrm dc02 -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | grep -qE "[45]"; then
+                        log_ok "DC02 ready after $((i*5))s"
+                        vagrant winrm dc02 -c "Restart-Service NlaSvc -Force; Start-Sleep 5" 2>/dev/null || true
+                        log_ok "DC02 network profile re-evaluated"
                         break
                     fi
-                    log_verbose "    DC02 attempt $i/12..."
+                    log_verbose "    DC02 attempt $i/24..."
                 done
                 ensure_adws dc02
             ) &
@@ -494,14 +502,17 @@ step_dc_joins() {
             SKIPPED_STEPS+=("DC03 join")
         else
             (
-                vagrant provision dc03 --provision-with join 2>&1 | filter_winrm
-                for i in $(seq 1 12); do
-                    sleep 3
-                    if vagrant winrm dc03 -c "Get-ADDomain" 2>/dev/null | grep -q "it"; then
-                        log_ok "DC03 ready after $((i*3))s"
+                vagrant provision dc03 --provision-with join 2>&1 | filter_winrm || true
+                vagrant reload dc03 --force
+                for i in $(seq 1 24); do
+                    sleep 5
+                    if vagrant winrm dc03 -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | grep -qE "[45]"; then
+                        log_ok "DC03 ready after $((i*5))s"
+                        vagrant winrm dc03 -c "Restart-Service NlaSvc -Force; Start-Sleep 5" 2>/dev/null || true
+                        log_ok "DC03 network profile re-evaluated"
                         break
                     fi
-                    log_verbose "    DC03 attempt $i/12..."
+                    log_verbose "    DC03 attempt $i/24..."
                 done
                 ensure_adws dc03
             ) &
