@@ -99,14 +99,14 @@ end
 
 Vagrant.configure("2") do |config|
 
-  config.vm.boot_timeout = 300
+  config.vm.boot_timeout = 900
   config.winrm.timeout   = 180
   config.winrm.retry_limit = 30
   config.winrm.retry_delay = 10
 
   config.hostmanager.enabled = true
   config.hostmanager.manage_host = false   # false: do NOT edit host OS hosts file (UAC on Windows, permissions on Linux/macOS)
-  config.hostmanager.manage_guest = true
+  config.hostmanager.manage_guest = false
   config.hostmanager.ignore_private_ip = false
 
   config.trigger.before :up do |trigger|
@@ -208,6 +208,14 @@ Vagrant.configure("2") do |config|
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
+
+    vm.vm.provision "postboot", type: "shell", run: "never",
+      path: "scripts/dc02_postboot.ps1", env: {
+        "DOMAIN"     => DOMAIN,
+        "ADMIN_PASS" => ADMIN_PASS,
+        "DC01_IP"    => DC01_IP,
+        "DC03_IP"    => DC03_IP
+      }
   end
 
   # ─── DC03 ─── Subdomain Controller (it.secscope.corp) ──────────────
@@ -236,6 +244,14 @@ Vagrant.configure("2") do |config|
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
+
+    vm.vm.provision "postboot", type: "shell", run: "never",
+      path: "scripts/dc03_postboot.ps1", env: {
+        "DOMAIN"       => DOMAIN,
+        "CHILD_DOMAIN" => CHILD_DOMAIN,
+        "ADMIN_PASS"   => ADMIN_PASS,
+        "DC01_IP"      => DC01_IP
+      }
   end
 
   # ─── SRV01 ─── MSSQL + IIS + ADCS CA ─────────────────────────────────────

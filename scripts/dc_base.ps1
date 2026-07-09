@@ -21,10 +21,16 @@ if ($nic2) {
     $ifIndex = $nic2.InterfaceIndex
     $nic2Name = $nic2.Name
     Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress $dcIP -PrefixLength 24 -DefaultGateway 192.168.200.1 -AddressFamily IPv4 -PolicyStore PersistentStore
+    netsh interface ip set address name="$nic2Name" static $dcIP 255.255.255.0 192.168.200.1
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
+    # Override DNS on all other adapters too (prevents DHCP DNS from NAT adapter)
+    $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
+    foreach ($o in $otherNics) {
+        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses $dnsServer -ErrorAction SilentlyContinue
+        Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false
+    }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"
     Write-Host "[$logPrefix] Waiting for network profile..."
     for ($j = 1; $j -le 8; $j++) {
@@ -40,7 +46,8 @@ if ($nic2) {
 } else {
     Write-Host "[$logPrefix] WARNING: Could not find secondary adapter"
     $idx = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceIndex
-    New-NetIPAddress -InterfaceIndex $idx -IPAddress $dcIP -PrefixLength 24 -DefaultGateway 192.168.200.1 -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+    $nicName = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name
+    netsh interface ip set address name="$nicName" static $dcIP 255.255.255.0 192.168.200.1
     Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $idx -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false

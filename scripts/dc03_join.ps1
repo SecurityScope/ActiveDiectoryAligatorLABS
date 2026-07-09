@@ -23,22 +23,24 @@ if (-not $reachable) {
     exit 1
 }
 
-Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on internal adapter..."
-$adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
-$mgmtNic = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).InterfaceIndex
-$intNic  = $adapters | Where-Object { $_.InterfaceIndex -ne $mgmtNic } | Select-Object -First 1
-if ($intNic) {
-    Set-DnsClientServerAddress -InterfaceIndex $intNic.InterfaceIndex -ServerAddresses $dc01IP
-    Write-Host "[dc03_join] DNS set on internal adapter: $($intNic.Name)"
-} else {
-    Write-Host "[dc03_join] WARNING: Could not find internal adapter, setting DNS on all adapters..."
-    foreach ($adapter in $adapters) {
-        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
-        Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name)"
-    }
+Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on all adapters..."
+$netAdapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+foreach ($adapter in $netAdapters) {
+    Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
+    Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name)"
 }
 Clear-DnsClientCache
 Write-Host "[dc03_join] DNS cache flushed"
+
+Write-Host "[dc03_join] Pinning secscope.corp to DC01 IP in hosts file..."
+if (-not (Select-String -Path "$env:windir\System32\drivers\etc\hosts" `
+        -Pattern "secscope.corp" -SimpleMatch -Quiet)) {
+    Add-Content -Path "$env:windir\System32\drivers\etc\hosts" `
+        -Value "$dc01IP secscope.corp dc01.secscope.corp dc01" -Force
+    Write-Host "[dc03_join] Hosts file entry added"
+} else {
+    Write-Host "[dc03_join] Hosts file entry already exists"
+}
 
 Write-Host "[dc03_join] Verifying DNS resolution of secscope.corp..."
 $dnsOk = $false
@@ -54,18 +56,7 @@ for ($i = 1; $i -le 6; $i++) {
     }
 }
 if (-not $dnsOk) {
-    Write-Host "[dc03_join] ERROR: Cannot resolve secscope.corp after 18s. Check DC01 is running and reachable."
-    exit 1
-}
-
-Write-Host "[dc03_join] Pinning secscope.corp to DC01 IP in hosts file..."
-if (-not (Select-String -Path "$env:windir\System32\drivers\etc\hosts" `
-        -Pattern "secscope.corp" -SimpleMatch -Quiet)) {
-    Add-Content -Path "$env:windir\System32\drivers\etc\hosts" `
-        -Value "$dc01IP secscope.corp dc01.secscope.corp dc01" -Force
-    Write-Host "[dc03_join] Hosts file entry added"
-} else {
-    Write-Host "[dc03_join] Hosts file entry already exists"
+    Write-Host "[dc03_join] WARNING: Cannot resolve secscope.corp via DNS after 18s. Continuing with hosts file."
 }
 
 Write-Host "[dc03_join] Syncing clock with DC01 ($dc01IP)..."
@@ -86,15 +77,24 @@ try {
 Write-Host "[dc03_join] Installing AD-Domain-Services and DNS..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
 
+$secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+
+Import-Module ADDSDeployment -ErrorAction SilentlyContinue
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+
 Write-Host "[dc03_join] Resolving OU name conflict for child domain..."
 try {
-    $conflictingOU = Get-ADOrganizationalUnit -Identity "OU=IT,DC=secscope,DC=corp" -ErrorAction SilentlyContinue
+    $conflictingOU = Get-ADOrganizationalUnit -Identity "OU=IT,DC=secscope,DC=corp" -Server $dc01IP -Credential $cred -ErrorAction Stop
     if ($conflictingOU) {
         Write-Host "[dc03_join] Temporarily renaming OU=IT to avoid conflict..."
-        Rename-ADObject -Identity $conflictingOU.DistinguishedName -NewName "IT_TEMP" -ErrorAction Stop
+        Rename-ADObject -Identity $conflictingOU.DistinguishedName -NewName "IT_TEMP" -Server $dc01IP -Credential $cred -ErrorAction Stop
         Write-Host "[dc03_join] OU renamed to IT_TEMP"
     }
-} catch { Write-Host "[dc03_join] No OU conflict found" }
+} catch { Write-Host "[dc03_join] No OU conflict found: $_" }
+
+$secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
 
 Write-Host "[dc03_join] Importing ADDSDeployment module..."
 Import-Module ADDSDeployment -ErrorAction SilentlyContinue
@@ -136,10 +136,8 @@ for ($i = 1; $i -le 5; $i++) {
         Install-ADDSDomain -NewDomainName "it" -ParentDomainName $domain -DomainType ChildDomain -NewDomainNetbiosName "ITSEC" -Credential $cred -SafeModeAdministratorPassword $dsrmSec -Force -NoRebootOnCompletion:$true -ErrorAction Stop
         $promoted = $true
         Write-Host "[dc03_join] Subdomain install succeeded"
-        Write-Host "[dc03_join] Setting Administrator password..."
-        net user Administrator $adminPass 2>&1 | Out-Null
-        Write-Host "[dc03_join] Administrator password set"
         Write-Host "[dc03_join] OU IT renamed to IT_TEMP for child domain compatibility."
+        Write-Host "[dc03_join] Post-promotion steps (password, ADWS, DNS) will run via dc03_postboot.ps1."
         break
     } catch {
         Write-Host "[dc03_join] Attempt $i/5 failed: $_"
@@ -151,15 +149,5 @@ if (-not $promoted) {
     exit 1
 }
 
-Write-Host "[dc03_join] Enabling AD Web Services..."
-Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
-Start-Service ADWS -ErrorAction SilentlyContinue
-
-Write-Host "[dc03_join] Disabling IPv6 DNS registration..."
-Get-NetAdapter | ForEach-Object {
-    Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
-    Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
-}
-Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
-
-Write-Host "[dc03_join] Subdomain install completed successfully. Reboot required (vagrant reload dc03)."
+Write-Host "[dc03_join] Subdomain install completed. Reboot required."
+Write-Host "[dc03_join] Post-promotion steps (ADWS, DNS, password) will run via dc03_postboot.ps1."

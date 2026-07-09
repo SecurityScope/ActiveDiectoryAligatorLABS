@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Continue"
 
 Write-Host "[sysprep] Creating unattend file..."
-$unattend = @'
+$computerName = $env:COMPUTERNAME
+$unattend = @"
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
     <settings pass="oobeSystem">
@@ -25,15 +26,21 @@ $unattend = @'
                 <Username>Administrator</Username>
                 <Enabled>true</Enabled>
             </AutoLogon>
+            <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd /c "sc config WinRM start= auto &amp; net start WinRM &amp; winrm set winrm/config/service @{AllowUnencrypted="true"} &amp; winrm set winrm/config/service/auth @{Basic="true"} &amp; netsh advfirewall set allprofiles state off"</CommandLine>
+                    <Order>1</Order>
+                </SynchronousCommand>
+            </FirstLogonCommands>
         </component>
     </settings>
     <settings pass="specialize">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <ComputerName>*</ComputerName>
+            <ComputerName>$computerName</ComputerName>
         </component>
     </settings>
 </unattend>
-'@
+"@
 
 $unattendPath = "C:\Windows\Temp\unattend_sid.xml"
 $unattend | Out-File -FilePath $unattendPath -Encoding UTF8

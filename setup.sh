@@ -30,7 +30,7 @@ ALL_VMS=(dc01 dc02 dc03 srv01 ws01 ws02 lin01)
 START_TIME=$(date +%s)
 EXECUTED_STEPS=()
 SKIPPED_STEPS=()
-export DC_WINRM_PASSWORD="$ADMIN_PASS"
+export DC_WINRM_PASSWORD="vagrant"
 
 # ── Verbosity ──────────────────────────────────────────────────────────────
 
@@ -116,6 +116,7 @@ check_running() {
 }
 
 check_dc01_postboot() {
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c "Get-ADDomain" 2>/dev/null | grep -q "secscope" || \
     vagrant winrm dc01 -c "Get-ADDomain" 2>/dev/null | grep -q "secscope"
 }
 
@@ -140,6 +141,14 @@ check_dc02_join() {
 
 check_dc03_join() {
     DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc03 -c "Get-ADDomain" 2>/dev/null | grep -q "it"
+}
+
+check_dc02_postboot() {
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc02 -c "Get-Service ADWS" 2>/dev/null | grep -q "Running"
+}
+
+check_dc03_postboot() {
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc03 -c "Get-Service ADWS" 2>/dev/null | grep -q "Running"
 }
 
 check_srv01_services() {
@@ -398,7 +407,7 @@ step_dc01_dns() {
     fi
 
     log_info "Cleaning stale NAT DNS records..."
-    vagrant winrm dc01 -c '
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c '
 $zone = "secscope.corp"
 Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
     $ip = $_.RecordData.IPv4Address.IPAddressToString
@@ -465,6 +474,54 @@ step_boot_remaining() {
     EXECUTED_STEPS+=("Boot remaining VMs")
 }
 
+# ── Step: sysprep (generate unique SIDs) ──
+step_sysprep() {
+    local sysprep_vms=()
+    for vm in dc02 dc03; do
+        if ! vm_selected "$vm"; then continue; fi
+        sysprep_vms+=("$vm")
+    done
+    if [ ${#sysprep_vms[@]} -eq 0 ]; then
+        log_skip "Sysprep: no VMs selected"
+        SKIPPED_STEPS+=("Sysprep")
+        return
+    fi
+
+    for vm in "${sysprep_vms[@]}"; do
+        log_step "[sysprep] Checking $vm..."
+        local role
+        role=$(DC_WINRM_PASSWORD="vagrant" vagrant winrm "$vm" -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | tr -d '\r\n ')
+        if [ "$role" -ge 4 ] 2>/dev/null; then
+            log_skip "$vm already a DC (role $role), skipping sysprep"
+            SKIPPED_STEPS+=("Sysprep $vm")
+            continue
+        fi
+        log_step "[sysprep] Generating new SID on $vm..."
+        vagrant provision "$vm" --provision-with sysprep 2>&1 | filter_winrm || true
+        log_info "Sysprep launched on $vm, machine will reboot. Waiting for OOBE..."
+        # sysprep /generalize /oobe /reboot takes 2-5 minutes
+        local online=false
+        for i in $(seq 1 30); do
+            sleep 20
+            if vagrant winrm "$vm" -c "hostname" 2>/dev/null | grep -qi "$vm"; then
+                log_ok "$vm back online after sysprep ($((i*20))s)"
+                online=true
+                break
+            fi
+            log_verbose "    $vm sysprep wait $i/30..."
+        done
+        if [ "$online" = false ]; then
+            log_err "$vm did not come back after sysprep"
+            exit 1
+        fi
+        log_info "Running vagrant reload on $vm to stabilize..."
+        vagrant reload "$vm" --force
+        log_info "Re-applying base config (IP) on $vm..."
+        vagrant provision "$vm" --provision-with base 2>&1 | filter_winrm || true
+        EXECUTED_STEPS+=("Sysprep $vm")
+    done
+}
+
 # ── Step 6+7: DC02 + DC03 joins in parallel ──
 step_dc_joins() {
     local join_pids=()
@@ -478,6 +535,7 @@ step_dc_joins() {
         else
             (
                 vagrant provision dc02 --provision-with join 2>&1 | filter_winrm || true
+                export DC_WINRM_PASSWORD="$ADMIN_PASS"
                 vagrant reload dc02 --force
                 for i in $(seq 1 24); do
                     sleep 5
@@ -503,6 +561,7 @@ step_dc_joins() {
         else
             (
                 vagrant provision dc03 --provision-with join 2>&1 | filter_winrm || true
+                export DC_WINRM_PASSWORD="$ADMIN_PASS"
                 vagrant reload dc03 --force
                 for i in $(seq 1 24); do
                     sleep 5
@@ -529,6 +588,42 @@ step_dc_joins() {
     fi
     [ " ${SKIPPED_STEPS[*]} " != *" DC02 join "* ] && EXECUTED_STEPS+=("DC02 join")
     [ " ${SKIPPED_STEPS[*]} " != *" DC03 join "* ] && EXECUTED_STEPS+=("DC03 join")
+}
+
+# ── Step 7b: DC02 postboot (DNS cleanup, ADWS, NLA, Server Manager flag) ──
+step_dc02_postboot() {
+    if ! vm_selected dc02; then
+        SKIPPED_STEPS+=("DC02 postboot")
+        return
+    fi
+    log_step "[6b/14] DC02 post-promotion config..."
+    if check_dc02_postboot; then
+        log_skip "DC02 already post-configured"
+        SKIPPED_STEPS+=("DC02 postboot")
+        return
+    fi
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant provision dc02 --provision-with postboot 2>&1 | filter_winrm || log_warn "DC02 postboot had warnings (non-critical)"
+    EXECUTED_STEPS+=("DC02 postboot")
+}
+
+# ── Step 7c: DC03 postboot (ADWS, DNS, password, NLA, Server Manager flag) ──
+step_dc03_postboot() {
+    if ! vm_selected dc03; then
+        SKIPPED_STEPS+=("DC03 postboot")
+        return
+    fi
+    log_step "[7b/14] DC03 post-promotion config..."
+    if check_dc03_postboot; then
+        log_skip "DC03 already post-configured"
+        SKIPPED_STEPS+=("DC03 postboot")
+        return
+    fi
+    # Password might still be 'vagrant' if the promotion rebooted before net user ran
+    DC_WINRM_PASSWORD="vagrant" vagrant provision dc03 --provision-with postboot 2>&1 | filter_winrm || {
+        log_info "Trying postboot with Admin password..."
+        DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant provision dc03 --provision-with postboot 2>&1 | filter_winrm || log_warn "DC03 postboot had warnings (non-critical)"
+    }
+    EXECUTED_STEPS+=("DC03 postboot")
 }
 
 # ── Step 8+9+10: SRV01 services, WS01/WS02 misconfig in parallel ──
@@ -666,6 +761,8 @@ cmd_deploy() {
     step_dc01_base
     step_dc01_postboot
     step_dc01_dns
+    export DC_WINRM_PASSWORD="$ADMIN_PASS"
+
     step_dc01_objects_base
 
     if [ "$DC01_ONLY" = true ]; then
@@ -679,8 +776,13 @@ cmd_deploy() {
         exit 0
     fi
 
+    export DC_WINRM_PASSWORD="vagrant"
     step_boot_remaining
+    step_sysprep
     step_dc_joins
+    export DC_WINRM_PASSWORD="$ADMIN_PASS"
+    step_dc02_postboot
+    step_dc03_postboot
     step_member_provisioning
     step_dc01_objects_final
     step_hardening

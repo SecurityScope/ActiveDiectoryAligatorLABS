@@ -103,6 +103,14 @@ try {
     Write-Host "[dc01_dns] DNS delegation for subdomain may already exist: $_"
 }
 
+Write-Host "[dc01_dns] Adding conditional forwarder for child domain..."
+try {
+    Add-DnsServerConditionalForwarderZone -Name $childDomain -MasterServers $dc03IP -ErrorAction SilentlyContinue
+    Write-Host "[dc01_dns] Conditional forwarder for $childDomain -> $dc03IP"
+} catch {
+    Write-Host "[dc01_dns] Conditional forwarder for child domain may already exist"
+}
+
 Write-Host "[dc01_dns] Setting domain functional level..."
 try {
     $currentMode = (Get-ADDomain -Identity $domain).DomainMode

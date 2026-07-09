@@ -79,7 +79,8 @@ if ($errContent) {
     Write-Host "[dc01_postboot] STDERR:"
     $errContent | Write-Host
 }
-if ($proc.ExitCode -ne 0) {
+$okExit = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3 -or [string]::IsNullOrEmpty("$($proc.ExitCode)"))
+if (-not $okExit) {
     if ($errContent -match "Name change pending") {
         Write-Host "[dc01_postboot] ERROR: Computer rename has not been applied (reboot missing)."
         Write-Host "[dc01_postboot] Run 'vagrant reload dc01 --force' first, then retry this provisioner."
@@ -87,6 +88,7 @@ if ($proc.ExitCode -ne 0) {
     Write-Host "[dc01_postboot] ERROR: Install-ADDSForest exited with code $($proc.ExitCode)"
     exit 1
 }
+Write-Host "[dc01_postboot] Install-ADDSForest exited with code $($proc.ExitCode) (0=success, 3=reboot required)"
 
 Write-Host "[dc01_postboot] Forest install completed. Reboot required (vagrant reload dc01)."
 Remove-Item $innerScriptPath -ErrorAction SilentlyContinue
