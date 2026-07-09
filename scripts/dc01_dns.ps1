@@ -124,12 +124,7 @@ try {
     Write-Host "[dc01_dns] Domain functional level check/set: $_"
 }
 
-@("AD-Domain-Services") | ForEach-Object {
-    $path = "HKLM:\SOFTWARE\Microsoft\ServerManager\ServicingStorage\ServerComponentCache\$_"
-    if (Test-Path $path) {
-        Set-ItemProperty -Path $path -Name "PostInstallComplete" -Value 1 -ErrorAction SilentlyContinue
-    }
-}
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "ConfigurationStatus" -Value 0 -ErrorAction SilentlyContinue
 
 Write-Host "[dc01_dns] Installing LAPS (offline-first fallback)..."
 $lapsLocal = "C:\vagrant\LAPS.x64.msi"

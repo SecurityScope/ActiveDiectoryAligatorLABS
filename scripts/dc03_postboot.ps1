@@ -102,11 +102,6 @@ ipconfig /registerdns 2>&1 | Out-Null
 nltest /dsregdns 2>&1 | Out-Null
 
 Write-Host "[dc03_postboot] Clearing Server Manager post-deployment flag..."
-@("AD-Domain-Services") | ForEach-Object {
-    $path = "HKLM:\SOFTWARE\Microsoft\ServerManager\ServicingStorage\ServerComponentCache\$_"
-    if (Test-Path $path) {
-        Set-ItemProperty -Path $path -Name "PostInstallComplete" -Value 1 -ErrorAction SilentlyContinue
-    }
-}
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "ConfigurationStatus" -Value 0 -ErrorAction SilentlyContinue
 
 Write-Host "[dc03_postboot] Done"
