@@ -44,6 +44,18 @@ if ($zone -and $zone.IsDsIntegrated) {
     Start-Sleep 5
 }
 
+Write-Host "[dc01_dns] Restarting DNS Server to reload zones from AD..."
+Restart-Service DNS -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 10
+Get-Service DNS | Select Status | ForEach-Object { Write-Host "[dc01_dns] DNS Server status: $($_.Status)" }
+
+Write-Host "[dc01_dns] Deleting stale flat-file zone backups..."
+$zoneFile = "$env:SystemRoot\System32\DNS\$domain.dns"
+if (Test-Path $zoneFile) {
+    Remove-Item $zoneFile -Force -ErrorAction SilentlyContinue
+    Write-Host "[dc01_dns] Removed stale zone file: $zoneFile"
+}
+
 Write-Host "[dc01_dns] Fixing DNS client on all adapters before SRV registration..."
 $adapters = Get-NetAdapter | Where-Object Status -eq "Up"
 foreach ($a in $adapters) {
@@ -81,11 +93,11 @@ if (-not $srvVerified) {
         $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
         if ($srv) { Write-Host "[dc01_dns] SRV records now present: $($srv.NameTarget)" }
         else {
-            Write-Host "[dc01_dns] ERROR: Unable to create SRV records. Manual DC promotion may be required."
-            Write-Host "[dc01_dns] Attempting to continue anyway..."
+            Write-Host "[dc01_dns] ERROR: Unable to create SRV records. Aborting."
+            exit 1
         }
     } catch {
-        Write-Host "[dc01_dns] ERROR: DNS resolution still failing. Aborting to prevent broken state."
+        Write-Host "[dc01_dns] ERROR: DNS resolution still failing. Aborting."
         exit 1
     }
 }
