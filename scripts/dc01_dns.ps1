@@ -34,9 +34,30 @@ if (-not $ready) {
     exit 1
 }
 
+Write-Host "[dc01_dns] Ensuring DNS zone is AD-integrated..."
+$zone = Get-DnsServerZone -Name $domain -ErrorAction SilentlyContinue
+if ($zone -and $zone.IsDsIntegrated) {
+    Write-Host "[dc01_dns] Zone $domain is already AD-integrated"
+} else {
+    Write-Host "[dc01_dns] Converting $domain zone to AD-integrated..."
+    ConvertTo-DnsServerPrimaryZone -Name $domain -ReplicationScope Domain -Force -ErrorAction SilentlyContinue
+    Start-Sleep 5
+}
+
+Write-Host "[dc01_dns] Fixing DNS client on all adapters before SRV registration..."
+$adapters = Get-NetAdapter | Where-Object Status -eq "Up"
+foreach ($a in $adapters) {
+    Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses "127.0.0.1"
+    Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
+    Write-Host "[dc01_dns] DNS on $($a.Name) -> 127.0.0.1 (no dyn reg)"
+}
+Clear-DnsClientCache
+
 Write-Host "[dc01_dns] Restarting Netlogon to register DNS SRV records..."
 Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 15
+Get-Service Netlogon | Select Status | ForEach-Object { Write-Host "[dc01_dns] Netlogon status: $($_.Status)" }
+
 Write-Host "[dc01_dns] Verifying SRV records exist..."
 $srvVerified = $false
 for ($i = 1; $i -le 6; $i++) {
@@ -49,14 +70,30 @@ for ($i = 1; $i -le 6; $i++) {
         }
     } catch { }
     Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/6)..."
-    Start-Sleep 10
+    Start-Sleep 15
 }
 if (-not $srvVerified) {
-    Write-Host "[dc01_dns] WARNING: SRV records still missing. Forcing Netlogon registration..."
+    Write-Host "[dc01_dns] WARNING: SRV records still missing after 90s!"
+    Write-Host "[dc01_dns] Forcing Netlogon registration..."
     nltest /dsregdns 2>&1 | Out-Null
-    Start-Sleep 10
+    Start-Sleep 15
+    try {
+        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
+        if ($srv) { Write-Host "[dc01_dns] SRV records now present: $($srv.NameTarget)" }
+        else {
+            Write-Host "[dc01_dns] ERROR: Unable to create SRV records. Manual DC promotion may be required."
+            Write-Host "[dc01_dns] Attempting to continue anyway..."
+        }
+    } catch {
+        Write-Host "[dc01_dns] ERROR: DNS resolution still failing. Aborting to prevent broken state."
+        exit 1
+    }
 }
-Write-Host "[dc01_dns] Proceeding with DNS configuration..."
+
+Write-Host "[dc01_dns] Restarting NLA (network profile re-detection)..."
+Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 5
+Write-Host "[dc01_dns] Network profiles re-evaluated"
 
 Write-Host "[dc01_dns] Setting Domain Administrator password..."
 try {
