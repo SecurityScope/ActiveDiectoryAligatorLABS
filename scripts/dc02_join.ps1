@@ -63,6 +63,25 @@ try {
     Write-Host "[dc02_join] AD requires clocks within 5 minutes of each other."
 }
 
+Write-Host "[dc02_join] Verifying SRV records for $domain..."
+$srvOk = $false
+for ($i = 1; $i -le 6; $i++) {
+    try {
+        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -ErrorAction Stop
+        if ($srv) {
+            Write-Host "[dc02_join] SRV record found: $($srv.NameTarget):$($srv.Port)"
+            $srvOk = $true
+            break
+        }
+    } catch { }
+    Write-Host "[dc02_join] SRV lookup attempt $i/6, waiting..."
+    Start-Sleep 5
+}
+if (-not $srvOk) {
+    Write-Host "[dc02_join] ERROR: _ldap SRV records not found for $domain. DC01 DNS may not be ready."
+    exit 1
+}
+
 Write-Host "[dc02_join] Installing AD-Domain-Services..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
 

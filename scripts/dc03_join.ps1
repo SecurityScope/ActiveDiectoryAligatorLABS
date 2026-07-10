@@ -63,29 +63,28 @@ for ($i = 1; $i -le 6; $i++) {
     }
 }
 if (-not $dnsOk) {
-    Write-Host "[dc03_join] WARNING: Cannot resolve secscope.corp via DNS after 18s. Continuing with hosts file."
+    Write-Host "[dc03_join] ERROR: Cannot resolve secscope.corp via DNS after 18s."
+    exit 1
 }
 
-Write-Host "[dc03_join] Syncing clock with DC01 ($dc01IP)..."
+Write-Host "[dc03_join] Checking if subdomain already exists..."
 try {
-    w32tm /resync 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        w32tm /config /syncfromflags:manual /manualpeerlist:$dc01IP 2>&1 | Out-Null
-        w32tm /resync 2>&1 | Out-Null
+    $dcRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
+    if ($dcRole -ge 4) {
+        Write-Host "[dc03_join] Already a domain controller (role $dcRole), skipping promotion"
+        exit 0
     }
-    $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[dc03_join] Clock synced. Current time: $currentTime"
-} catch {
-    Write-Host "[dc03_join] WARNING: Time sync failed: $_"
-    Write-Host "[dc03_join] Current time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    Write-Host "[dc03_join] AD requires clocks within 5 minutes of each other."
-}
+} catch {}
+$secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
+try {
+    $null = Get-ADDomain -Identity $childDomain -Server $dc01IP -Credential $cred -ErrorAction Stop
+    Write-Host "[dc03_join] Subdomain $childDomain already exists in forest, skipping promotion"
+    exit 0
+} catch {}
 
 Write-Host "[dc03_join] Installing AD-Domain-Services and DNS..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
-
-$secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
 
 Import-Module ADDSDeployment -ErrorAction SilentlyContinue
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
@@ -100,26 +99,19 @@ try {
     }
 } catch { Write-Host "[dc03_join] No OU conflict found: $_" }
 
-$secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
-
-Write-Host "[dc03_join] Importing ADDSDeployment module..."
-Import-Module ADDSDeployment -ErrorAction SilentlyContinue
-Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+Write-Host "[dc03_join] Syncing clock with DC01 ($dc01IP)..."
+try {
+    w32tm /resync 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        w32tm /config /syncfromflags:manual /manualpeerlist:$dc01IP 2>&1 | Out-Null
+        w32tm /resync 2>&1 | Out-Null
+    }
+    Write-Host "[dc03_join] Clock synced. Current time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+} catch {
+    Write-Host "[dc03_join] WARNING: Time sync failed: $_"
+}
 
 Write-Host "[dc03_join] Creating subdomain $childDomain under $domain..."
-try {
-    $dcRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-    if ($dcRole -ge 4) {
-        Write-Host "[dc03_join] Already a domain controller (role $dcRole), skipping promotion"
-        exit 0
-    }
-} catch {}
-try {
-    $null = Get-ADDomain -Identity $childDomain -ErrorAction Stop
-    Write-Host "[dc03_join] Subdomain $childDomain already exists, skipping promotion"
-    exit 0
-} catch {}
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
 Write-Host "[dc03_join] Cleaning up any stale DC03 AD objects..."

@@ -78,7 +78,11 @@ def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: SERVER_BOX
       v.customize ["modifyvm", :id, "--vram", "128"]
       v.customize ["modifyvm", :id, "--graphicscontroller", "vboxsvga"]
       v.customize ["modifyvm", :id, "--accelerate3d", "off"]
-      v.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+      if domain_controller
+        v.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]
+      else
+        v.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+      end
       v.customize ["modifyvm", :id, "--nic2", "natnetwork"]
       v.customize ["modifyvm", :id, "--nat-network2", "SECSCOPE.CORP"]
       # Boxes built by Packer boot from DVD (needed for OS install) and that

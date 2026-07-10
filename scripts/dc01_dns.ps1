@@ -19,93 +19,111 @@ $ready = $false
 for ($i = 1; $i -le 12; $i++) {
     try {
         $null = Get-ADDomain -ErrorAction Stop
-        $null = Get-ADDomainController -Discover -ErrorAction Stop
         $ready = $true
         Write-Host "[dc01_dns] AD services ready (attempt $i)"
         break
     } catch {
         Write-Host "[dc01_dns] Attempt $i/12, waiting..."
-        Start-Sleep 5
+        Start-Sleep 10
     }
 }
 if (-not $ready) {
-    Write-Host "[dc01_dns] ERROR: AD Domain Services not found after 60s."
-    Write-Host "[dc01_dns] Did you run 'vagrant reload dc01' after the postboot provisioner?"
+    Write-Host "[dc01_dns] ERROR: AD Domain Services not found after 120s."
     exit 1
 }
 
-Write-Host "[dc01_dns] Ensuring DNS zone is AD-integrated..."
-$zone = Get-DnsServerZone -Name $domain -ErrorAction SilentlyContinue
-if ($zone -and $zone.IsDsIntegrated) {
-    Write-Host "[dc01_dns] Zone $domain is already AD-integrated"
-} else {
-    Write-Host "[dc01_dns] Converting $domain zone to AD-integrated..."
-    ConvertTo-DnsServerPrimaryZone -Name $domain -ReplicationScope Domain -Force -ErrorAction SilentlyContinue
-    Start-Sleep 5
-}
-
-Write-Host "[dc01_dns] Restarting DNS Server to reload zones from AD..."
-Restart-Service DNS -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 10
-Get-Service DNS | Select Status | ForEach-Object { Write-Host "[dc01_dns] DNS Server status: $($_.Status)" }
-
-Write-Host "[dc01_dns] Deleting stale flat-file zone backups..."
-$zoneFile = "$env:SystemRoot\System32\DNS\$domain.dns"
-if (Test-Path $zoneFile) {
-    Remove-Item $zoneFile -Force -ErrorAction SilentlyContinue
-    Write-Host "[dc01_dns] Removed stale zone file: $zoneFile"
-}
-
-Write-Host "[dc01_dns] Fixing DNS client on all adapters before SRV registration..."
+Write-Host "[dc01_dns] Fixing DNS client before SRV registration..."
 $adapters = Get-NetAdapter | Where-Object Status -eq "Up"
 foreach ($a in $adapters) {
     Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses "127.0.0.1"
     Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
-    Write-Host "[dc01_dns] DNS on $($a.Name) -> 127.0.0.1 (no dyn reg)"
 }
 Clear-DnsClientCache
+Write-Host "[dc01_dns] DNS client -> 127.0.0.1 on all adapters"
 
-Write-Host "[dc01_dns] Restarting Netlogon to register DNS SRV records..."
-Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+Write-Host "[dc01_dns] Ensuring DNS server uses AD storage..."
+dnscmd localhost /Config /DsAvailable 1 2>&1 | Out-Null
+$zoneFile = "$env:SystemRoot\System32\DNS\$domain.dns"
+$msdcsFile = "$env:SystemRoot\System32\DNS\_msdcs.$domain.dns"
+Remove-Item $zoneFile -Force -ErrorAction SilentlyContinue
+Remove-Item $msdcsFile -Force -ErrorAction SilentlyContinue
+Write-Host "[dc01_dns] Deleted stale zone files"
+
+Write-Host "[dc01_dns] Restarting DNS Server..."
+Restart-Service DNS -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 15
-Get-Service Netlogon | Select Status | ForEach-Object { Write-Host "[dc01_dns] Netlogon status: $($_.Status)" }
+Write-Host "[dc01_dns] DNS Server restarted"
 
-Write-Host "[dc01_dns] Verifying SRV records exist..."
+Write-Host "[dc01_dns] Ensuring zones are AD-integrated..."
+$zone = Get-DnsServerZone -Name $domain -ErrorAction SilentlyContinue
+if (-not ($zone -and $zone.IsDsIntegrated)) {
+    ConvertTo-DnsServerPrimaryZone -Name $domain -ReplicationScope Domain -Force -ErrorAction SilentlyContinue
+    Write-Host "[dc01_dns] $domain converted to AD-integrated"
+}
+$mszone = Get-DnsServerZone -Name "_msdcs.$domain" -ErrorAction SilentlyContinue
+if (-not ($mszone -and $mszone.IsDsIntegrated)) {
+    ConvertTo-DnsServerPrimaryZone -Name "_msdcs.$domain" -ReplicationScope Forest -Force -ErrorAction SilentlyContinue
+    Write-Host "[dc01_dns] _msdcs.$domain converted to AD-integrated (Forest)"
+}
+
+Write-Host "[dc01_dns] Restarting Netlogon to register SRV records..."
+Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 20
+$nlStatus = (Get-Service Netlogon -ErrorAction SilentlyContinue).Status
+Write-Host "[dc01_dns] Netlogon status: $nlStatus"
+
+Write-Host "[dc01_dns] Verifying critical SRV records exist..."
+$criticalSRV = @(
+    "_ldap._tcp.$domain",
+    "_kerberos._tcp.$domain",
+    "_gc._tcp.$domain",
+    "_ldap._tcp.Default-First-Site-Name._sites.$domain",
+    "_ldap._tcp.dc._msdcs.$domain"
+)
+
 $srvVerified = $false
-for ($i = 1; $i -le 6; $i++) {
+for ($i = 1; $i -le 8; $i++) {
     try {
-        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
-        if ($srv) {
-            Write-Host "[dc01_dns] _ldap SRV record verified: $($srv.NameTarget):$($srv.Port)"
+        $found = $false
+        foreach ($name in $criticalSRV) {
+            $srv = Resolve-DnsName $name -Type SRV -Server 127.0.0.1 -ErrorAction Stop
+            if ($srv) {
+                Write-Host "[dc01_dns] SRV OK: $name -> $($srv.NameTarget)"
+                $found = $true
+                break
+            }
+        }
+        if ($found) {
             $srvVerified = $true
             break
         }
     } catch { }
-    Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/6)..."
+    Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/8)..."
     Start-Sleep 15
-}
-if (-not $srvVerified) {
-    Write-Host "[dc01_dns] WARNING: SRV records still missing after 90s!"
-    Write-Host "[dc01_dns] Forcing Netlogon registration..."
-    nltest /dsregdns 2>&1 | Out-Null
-    Start-Sleep 15
-    try {
-        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
-        if ($srv) { Write-Host "[dc01_dns] SRV records now present: $($srv.NameTarget)" }
-        else {
-            Write-Host "[dc01_dns] ERROR: Unable to create SRV records. Aborting."
-            exit 1
-        }
-    } catch {
-        Write-Host "[dc01_dns] ERROR: DNS resolution still failing. Aborting."
-        exit 1
+    if ($i -eq 4) {
+        Write-Host "[dc01_dns] Forcing Netlogon DNS registration..."
+        nltest /dsregdns 2>&1 | Out-Null
+        Start-Sleep 10
     }
 }
+if (-not $srvVerified) {
+    Write-Host "[dc01_dns] ERROR: SRV records still missing after 120s!"
+    Write-Host "[dc01_dns] Last attempt: restarting DNS + Netlogon one more time..."
+    Restart-Service DNS -Force -ErrorAction SilentlyContinue
+    Start-Sleep 10
+    Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+    Start-Sleep 30
+    try {
+        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
+        if (-not $srv) { Write-Host "[dc01_dns] FATAL: Unable to create SRV records. Aborting."; exit 1 }
+        Write-Host "[dc01_dns] SRV records now present: $($srv.NameTarget)"
+    } catch { Write-Host "[dc01_dns] FATAL: DNS resolution still fails. Aborting."; exit 1 }
+}
+Write-Host "[dc01_dns] SRV records verified successfully"
 
 Write-Host "[dc01_dns] Restarting NLA (network profile re-detection)..."
 Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 5
-Write-Host "[dc01_dns] Network profiles re-evaluated"
 
 Write-Host "[dc01_dns] Setting Domain Administrator password..."
 try {
@@ -121,7 +139,6 @@ try {
     $dcName = (Get-ADDomainController -Discover -DomainName $domain -ErrorAction Stop).Name
     Write-Host "[dc01_dns] Domain controller verified: $dcName"
     Import-Module ADDSDeployment -ErrorAction SilentlyContinue
-    Write-Host "[dc01_dns] DC promotion confirmed"
 } catch {
     Write-Host "[dc01_dns] WARNING: DC verification failed: $_"
 }
@@ -144,16 +161,10 @@ try {
 
 Write-Host "[dc01_dns] Adding DNS A records..."
 $records = @{
-    "dc01"  = $dc01IP
-    "dc02"  = $dc02IP
-    "dc03"  = $dc03IP
-    "srv01" = $srv01IP
-    "ws01"  = $ws01IP
-    "ws02"  = $ws02IP
-    "lin01" = $lin01IP
-    "wpad"  = $kaliIP
+    "dc01"  = $dc01IP; "dc02" = $dc02IP; "dc03" = $dc03IP
+    "srv01" = $srv01IP; "ws01" = $ws01IP; "ws02" = $ws02IP
+    "lin01" = $lin01IP; "wpad" = $kaliIP
 }
-
 foreach ($name in $records.Keys) {
     try {
         Add-DnsServerResourceRecordA -Name $name -ZoneName $domain -IPv4Address $records[$name] -ErrorAction Stop
@@ -168,7 +179,7 @@ try {
     Add-DnsServerZoneDelegation -Name $domain -ChildZoneName "it" -NameServer "dc03.$domain" -IPAddress $dc03IP -ErrorAction SilentlyContinue
     Write-Host "[dc01_dns] DNS delegation: it.$domain -> dc03 ($dc03IP)"
 } catch {
-    Write-Host "[dc01_dns] DNS delegation for subdomain may already exist: $_"
+    Write-Host "[dc01_dns] DNS delegation may already exist: $_"
 }
 
 Write-Host "[dc01_dns] Adding conditional forwarder for child domain..."
@@ -176,7 +187,7 @@ try {
     Add-DnsServerConditionalForwarderZone -Name $childDomain -MasterServers $dc03IP -ErrorAction SilentlyContinue
     Write-Host "[dc01_dns] Conditional forwarder for $childDomain -> $dc03IP"
 } catch {
-    Write-Host "[dc01_dns] Conditional forwarder for child domain may already exist"
+    Write-Host "[dc01_dns] Conditional forwarder may already exist"
 }
 
 Write-Host "[dc01_dns] Setting domain functional level..."
@@ -197,44 +208,35 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "
 Write-Host "[dc01_dns] Installing LAPS (offline-first fallback)..."
 $lapsLocal = "C:\vagrant\LAPS.x64.msi"
 $lapsTemp  = "C:\Windows\Temp\LAPS.x64.msi"
-
 if (Test-Path $lapsLocal) {
-    Write-Host "[dc01_dns] Found local LAPS MSI, installing..."
     Start-Process msiexec.exe -ArgumentList "/i `"$lapsLocal`" /quiet /norestart" -Wait
     Write-Host "[dc01_dns] LAPS installed from local file"
 } elseif (Test-Path $lapsTemp) {
-    Write-Host "[dc01_dns] Found cached LAPS MSI, installing..."
     Start-Process msiexec.exe -ArgumentList "/i `"$lapsTemp`" /quiet /norestart" -Wait
     Write-Host "[dc01_dns] LAPS installed from cached file"
 } else {
     try {
         $lapsUrl = "https://download.microsoft.com/download/C/7/A/C7AAD914-A8A6-4904-88A1-29E657445D03/LAPS.x64.msi"
         Invoke-WebRequest -Uri $lapsUrl -OutFile $lapsTemp -TimeoutSec 120 -ErrorAction Stop
-        Write-Host "[dc01_dns] LAPS downloaded, installing..."
         Start-Process msiexec.exe -ArgumentList "/i `"$lapsTemp`" /quiet /norestart" -Wait
         Write-Host "[dc01_dns] LAPS installed from internet"
     } catch {
-        Write-Host "[dc01_dns] WARNING: LAPS unavailable. Place LAPS.x64.msi in ActiveDirectoryAlligatorLABS/ folder or download from https://www.microsoft.com/en-us/download/details.aspx?id=46899"
+        Write-Host "[dc01_dns] WARNING: LAPS unavailable"
     }
 }
 
-Write-Host "[dc01_dns] Cleaning up stale NAT IPs from DNS zone..."
-$zone = $domain
-Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
-    $ip = $_.RecordData.IPv4Address.IPAddressToString
-    if ($ip -like "10.0.2.*") {
-        Write-Host "[dc01_dns] Removing stale A record: $($_.HostName) -> $ip"
-        Remove-DnsServerResourceRecord -ZoneName $zone -RRType A -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
+Write-Host "[dc01_dns] Cleaning stale NAT IPs from DNS zones..."
+Get-DnsServerZone | Where-Object ZoneType -eq "Primary" | ForEach-Object {
+    $zoneName = $_.ZoneName
+    Get-DnsServerResourceRecord -ZoneName $zoneName -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
+        $ip = $_.RecordData.IPv4Address.IPAddressToString
+        if ($ip -like "10.0.2.*") {
+            Write-Host "[dc01_dns] Removing stale A: $($_.HostName) -> $ip from $zoneName"
+            Remove-DnsServerResourceRecord -ZoneName $zoneName -RRType A -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 Write-Host "[dc01_dns] Disabling IPv6 DNS server registration..."
 Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
-Get-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -ErrorAction SilentlyContinue | ForEach-Object {
-    $ip = $_.RecordData.IPv6Address.IPAddressToString
-    if ($ip -like "fd17*") {
-        Write-Host "[dc01_dns] Removing stale AAAA record: $($_.HostName) -> $ip"
-        Remove-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
-    }
-}
 
 Write-Host "[dc01_dns] Done"

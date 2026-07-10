@@ -25,10 +25,11 @@ if ($nic2) {
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
-    # Set NAT adapter DNS to 127.0.0.1 (placeholder, fails fast, no external DNS)
+    # Prefer natnetwork adapter for DNS (lower metric = higher priority)
+    Set-NetIPInterface -InterfaceIndex $ifIndex -InterfaceMetric 10
     $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
     foreach ($o in $otherNics) {
-        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses "127.0.0.1" -ErrorAction SilentlyContinue
+        Set-NetIPInterface -InterfaceIndex $o.InterfaceIndex -InterfaceMetric 200
         Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false
     }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"

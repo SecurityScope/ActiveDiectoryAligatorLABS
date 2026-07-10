@@ -499,16 +499,15 @@ step_sysprep() {
         log_step "[sysprep] Generating new SID on $vm..."
         vagrant provision "$vm" --provision-with sysprep 2>&1 | filter_winrm || true
         log_info "Sysprep launched on $vm, machine will reboot. Waiting for OOBE..."
-        # sysprep /generalize /oobe /reboot takes 2-5 minutes
         local online=false
-        for i in $(seq 1 30); do
-            sleep 20
+        for i in $(seq 1 12); do
+            sleep 10
             if vagrant winrm "$vm" -c "hostname" 2>/dev/null | grep -qi "$vm"; then
-                log_ok "$vm back online after sysprep ($((i*20))s)"
+                log_ok "$vm back online after sysprep ($((i*10))s)"
                 online=true
                 break
             fi
-            log_verbose "    $vm sysprep wait $i/30..."
+            log_verbose "    $vm sysprep wait $i/12..."
         done
         if [ "$online" = false ]; then
             log_err "$vm did not come back after sysprep"
@@ -537,16 +536,22 @@ step_dc_joins() {
                 vagrant provision dc02 --provision-with join 2>&1 | filter_winrm || true
                 export DC_WINRM_PASSWORD="$ADMIN_PASS"
                 vagrant reload dc02 --force
+                local dc02_ready=false
                 for i in $(seq 1 24); do
                     sleep 5
                     if vagrant winrm dc02 -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | grep -qE "[45]"; then
                         log_ok "DC02 ready after $((i*5))s"
                         vagrant winrm dc02 -c "Restart-Service NlaSvc -Force; Start-Sleep 5" 2>/dev/null || true
                         log_ok "DC02 network profile re-evaluated"
+                        dc02_ready=true
                         break
                     fi
                     log_verbose "    DC02 attempt $i/24..."
                 done
+                if [ "$dc02_ready" = false ]; then
+                    log_err "DC02 did not become a domain controller within 120s"
+                    exit 1
+                fi
                 ensure_adws dc02
             ) &
             join_pids+=($!)
@@ -563,16 +568,22 @@ step_dc_joins() {
                 vagrant provision dc03 --provision-with join 2>&1 | filter_winrm || true
                 export DC_WINRM_PASSWORD="$ADMIN_PASS"
                 vagrant reload dc03 --force
+                local dc03_ready=false
                 for i in $(seq 1 24); do
                     sleep 5
                     if vagrant winrm dc03 -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | grep -qE "[45]"; then
                         log_ok "DC03 ready after $((i*5))s"
                         vagrant winrm dc03 -c "Restart-Service NlaSvc -Force; Start-Sleep 5" 2>/dev/null || true
                         log_ok "DC03 network profile re-evaluated"
+                        dc03_ready=true
                         break
                     fi
                     log_verbose "    DC03 attempt $i/24..."
                 done
+                if [ "$dc03_ready" = false ]; then
+                    log_err "DC03 did not become a domain controller within 120s"
+                    exit 1
+                fi
                 ensure_adws dc03
             ) &
             join_pids+=($!)
