@@ -23,11 +23,18 @@ if (-not $reachable) {
     exit 1
 }
 
-Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on all adapters..."
+Write-Host "[dc03_join] Setting DNS to DC01 ($dc01IP) on natnetwork adapters..."
 $netAdapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
 foreach ($adapter in $netAdapters) {
-    Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
-    Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name)"
+    $ips = Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    if ($ips.IPAddress -like "192.168.*") {
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
+        Write-Host "[dc03_join] DNS set on adapter: $($adapter.Name) (192.168.x)"
+    } else {
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+        Set-DnsClient -InterfaceIndex $adapter.InterfaceIndex -RegisterThisConnectionsAddress $false
+        Write-Host "[dc03_join] Reset DNS on adapter: $($adapter.Name) (use DHCP, no dyn reg)"
+    }
 }
 Clear-DnsClientCache
 Write-Host "[dc03_join] DNS cache flushed"

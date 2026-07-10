@@ -25,10 +25,10 @@ if ($nic2) {
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
-    # Override DNS on all other adapters too (prevents DHCP DNS from NAT adapter)
+    # On the NAT adapter: reset DNS to DHCP (can't route to 192.168.x), but disable dyn reg
     $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
     foreach ($o in $otherNics) {
-        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses $dnsServer -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue
         Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false
     }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"
