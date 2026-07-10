@@ -41,6 +41,23 @@ foreach ($a in $adapters) {
 Clear-DnsClientCache
 Write-Host "[dc01_dns] DNS client -> 127.0.0.1 on all adapters"
 
+Write-Host "[dc01_dns] Waiting for AD to signal DNS sync completion..."
+$dsReady = $false
+for ($i = 1; $i -le 24; $i++) {
+    $dsAvail = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNS Server" -Name "DsAvailable" -ErrorAction SilentlyContinue).DsAvailable
+    if ($dsAvail -eq 1) {
+        Write-Host "[dc01_dns] AD signaled sync complete after $((i-1)*10)s"
+        $dsReady = $true
+        break
+    }
+    Write-Host "[dc01_dns] DsAvailable=$dsAvail, waiting (attempt $i/24)..."
+    Start-Sleep 10
+}
+if (-not $dsReady) {
+    Write-Host "[dc01_dns] WARNING: DsAvailable not set after 240s, forcing..."
+    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNS Server" -Name "DsAvailable" -Value 1 -Type DWord -Force
+}
+
 Write-Host "[dc01_dns] Ensuring DNS server uses AD storage..."
 dnscmd localhost /Config /DsAvailable 1 2>&1 | Out-Null
 $zoneFile = "$env:SystemRoot\System32\DNS\$domain.dns"
@@ -73,31 +90,14 @@ $nlStatus = (Get-Service Netlogon -ErrorAction SilentlyContinue).Status
 Write-Host "[dc01_dns] Netlogon status: $nlStatus"
 
 Write-Host "[dc01_dns] Verifying critical SRV records exist..."
-$criticalSRV = @(
-    "_ldap._tcp.$domain",
-    "_kerberos._tcp.$domain",
-    "_gc._tcp.$domain",
-    "_ldap._tcp.Default-First-Site-Name._sites.$domain",
-    "_ldap._tcp.dc._msdcs.$domain"
-)
-
 $srvVerified = $false
 for ($i = 1; $i -le 8; $i++) {
-    try {
-        $found = $false
-        foreach ($name in $criticalSRV) {
-            $srv = Resolve-DnsName $name -Type SRV -Server 127.0.0.1 -ErrorAction Stop
-            if ($srv) {
-                Write-Host "[dc01_dns] SRV OK: $name -> $($srv.NameTarget)"
-                $found = $true
-                break
-            }
-        }
-        if ($found) {
-            $srvVerified = $true
-            break
-        }
-    } catch { }
+    $result = nslookup -type=srv _ldap._tcp.$domain 127.0.0.1 2>&1
+    if ($result -match "svr hostname") {
+        Write-Host "[dc01_dns] _ldap SRV record found via nslookup"
+        $srvVerified = $true
+        break
+    }
     Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/8)..."
     Start-Sleep 15
     if ($i -eq 4) {
@@ -113,11 +113,12 @@ if (-not $srvVerified) {
     Start-Sleep 10
     Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
     Start-Sleep 30
-    try {
-        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
-        if (-not $srv) { Write-Host "[dc01_dns] FATAL: Unable to create SRV records. Aborting."; exit 1 }
-        Write-Host "[dc01_dns] SRV records now present: $($srv.NameTarget)"
-    } catch { Write-Host "[dc01_dns] FATAL: DNS resolution still fails. Aborting."; exit 1 }
+    $result = nslookup -type=srv _ldap._tcp.$domain 127.0.0.1 2>&1
+    if ($result -notmatch "svr hostname") {
+        Write-Host "[dc01_dns] FATAL: SRV records could not be created. Aborting."
+        exit 1
+    }
+    Write-Host "[dc01_dns] SRV records now present (verified by nslookup)"
 }
 Write-Host "[dc01_dns] SRV records verified successfully"
 
