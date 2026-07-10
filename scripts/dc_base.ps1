@@ -25,10 +25,10 @@ if ($nic2) {
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
-    # Remove DNS from NAT adapter entirely (prevents queries via 10.0.2.x gateway)
+    # Set NAT adapter DNS to 127.0.0.1 (placeholder, fails fast, no external DNS)
     $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
     foreach ($o in $otherNics) {
-        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses $null -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses "127.0.0.1" -ErrorAction SilentlyContinue
         Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false
     }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"

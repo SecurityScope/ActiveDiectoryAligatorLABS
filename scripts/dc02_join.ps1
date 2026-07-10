@@ -30,9 +30,9 @@ foreach ($adapter in $netAdapters) {
         Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $dc01IP
         Write-Host "[dc02_join] DNS set on adapter: $($adapter.Name) (192.168.x)"
     } else {
-        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $null -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses "127.0.0.1" -ErrorAction SilentlyContinue
         Set-DnsClient -InterfaceIndex $adapter.InterfaceIndex -RegisterThisConnectionsAddress $false
-        Write-Host "[dc02_join] DNS removed from adapter: $($adapter.Name)"
+        Write-Host "[dc02_join] DNS set to 127.0.0.1 on adapter: $($adapter.Name) (NAT, no dyn reg)"
     }
 }
 Clear-DnsClientCache

@@ -34,10 +34,29 @@ if (-not $ready) {
     exit 1
 }
 
-Write-Host "[dc01_dns] Triggering network profile re-detection (NLA)..."
-Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
-Write-Host "[dc01_dns] Network profiles re-evaluated"
+Write-Host "[dc01_dns] Restarting Netlogon to register DNS SRV records..."
+Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 15
+Write-Host "[dc01_dns] Verifying SRV records exist..."
+$srvVerified = $false
+for ($i = 1; $i -le 6; $i++) {
+    try {
+        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -Server 127.0.0.1 -ErrorAction Stop
+        if ($srv) {
+            Write-Host "[dc01_dns] _ldap SRV record verified: $($srv.NameTarget):$($srv.Port)"
+            $srvVerified = $true
+            break
+        }
+    } catch { }
+    Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/6)..."
+    Start-Sleep 10
+}
+if (-not $srvVerified) {
+    Write-Host "[dc01_dns] WARNING: SRV records still missing. Forcing Netlogon registration..."
+    nltest /dsregdns 2>&1 | Out-Null
+    Start-Sleep 10
+}
+Write-Host "[dc01_dns] Proceeding with DNS configuration..."
 
 Write-Host "[dc01_dns] Setting Domain Administrator password..."
 try {
