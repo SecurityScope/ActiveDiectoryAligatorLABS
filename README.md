@@ -56,9 +56,10 @@ The `setup.sh` / `setup.ps1` scripts support multiple subcommands and options:
 
 ```bash
 # Build boxes
-./setup.sh build-boxes              # Build both boxes
+./setup.sh build-boxes              # Build all boxes
 ./setup.sh build-boxes --server-only   # Server 2022 only
 ./setup.sh build-boxes --workstation-only  # Windows 10 only
+./setup.sh build-boxes --debian-only  # Debian only
 
 # Deploy (default)
 ./setup.sh                          # Full deploy, all VMs
@@ -288,7 +289,7 @@ All VMs connect via a VirtualBox NAT Network named `SECSCOPE.CORP` (subnet `192.
 
 **WinRM timeout:** Windows VMs are slow on first boot. The Vagrantfile sets `boot_timeout = 300` and `winrm.timeout = 180`. If you still get timeouts, increase these values in the Vagrantfile.
 
-**Box not found:** Windows boxes must be built with `./setup.sh build-boxes` before running `vagrant up`. Debian (`debian/bookworm64`) is the only box downloaded automatically.
+**Box not found:** Windows and Debian boxes must be built with `./setup.sh build-boxes` before running `vagrant up`.
 
 **"WS01 not found" during objects provisioning:** Computers must be domain-joined before `dc01_objects.ps1` can apply ACLs to them. The setup scripts run a final objects pass after all VMs are up.
 

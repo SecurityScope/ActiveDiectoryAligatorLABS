@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADMIN_PASS="${ADMIN_PASS:-SecScope2024!}"
 SERVER_ISO="${SERVER_ISO:-${SCRIPT_DIR}/iso/SERVER_EVAL_x64FRE_en-us.iso}"
 WIN10_ISO="${WIN10_ISO:-${SCRIPT_DIR}/iso/Win10_22H2_English_x64v1.iso}"
+DEBIAN_ISO="${DEBIAN_ISO:-${SCRIPT_DIR}/iso/debian-12.15.0-amd64-netinst-preseed.iso}"
 
 DOMAIN="secscope.corp"
 DC01_IP="192.168.200.10"
@@ -104,10 +105,20 @@ SKIP_SERVICES=false
 SKIP_MISCONFIG=false
 SKIP_HARDENING=false
 SKIP_LINUX=false
+SKIP_NLA_FIX=false
+AV_UPDATE_GPO=false
+# Seal the NAT adapter by default at the end of a full deploy: this removes the
+# VirtualBox NAT nic1 (10.0.2.x) so each VM is single-homed on 192.168.200.x,
+# permanently eliminating the NAT-leak / network-profile-flip class of bugs.
+# It severs Vagrant/WinRM/RDP management, so it is skipped automatically for
+# partial/scoped runs (see below) and can be disabled with --no-seal.
+SEAL_NETWORK=true
+SEAL_EXPLICIT=false
 DC01_ONLY=false
 SKIP_VAGRANT_ADD=false
 BUILD_SERVER=true
 BUILD_WIN10=true
+BUILD_DEBIAN=true
 
 # ── Check functions ────────────────────────────────────────────────────────
 
@@ -130,9 +141,41 @@ check_dc01_objects_base() {
 }
 
 check_dc01_objects() {
+    # The final objects pass applies the per-MEMBER ACLs (WS01 HelpDesk
+    # GenericWrite, WS02 unconstrained delegation, SRV01 constrained delegation).
+    # These only exist once the members have joined, so the old check — which
+    # merely grepped for the string "WS01" in Get-ADComputer output (always
+    # present, even with zero ACLs applied) — produced a false positive and made
+    # step 11 self-skip, leaving delegation unset. This verifies the actual
+    # applied state, and only for the members that are in scope for this run.
+    local check_ws01=false check_ws02=false check_srv01=false
+    vm_selected ws01  && check_ws01=true
+    vm_selected ws02  && check_ws02=true
+    vm_selected srv01 && check_srv01=true
+
+    # Nothing delegation-bearing selected -> the base pass covers everything.
+    if [ "$check_ws01" = false ] && [ "$check_ws02" = false ] && [ "$check_srv01" = false ]; then
+        return 0
+    fi
+
+    local script='$ok = $true; '
+    if [ "$check_ws01" = true ]; then
+        script+='try { $dn=(Get-ADComputer WS01).DistinguishedName; $sid=(Get-ADGroup HelpDesk).SID; $ace=(Get-Acl "AD:\$dn").Access | Where-Object { $_.ActiveDirectoryRights -match "GenericWrite" -and $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value }; if (-not $ace) { $ok=$false } } catch { $ok=$false }; '
+    fi
+    if [ "$check_ws02" = true ]; then
+        script+='try { if (-not (Get-ADComputer WS02 -Properties TrustedForDelegation).TrustedForDelegation) { $ok=$false } } catch { $ok=$false }; '
+    fi
+    if [ "$check_srv01" = true ]; then
+        script+='try { if (-not (Get-ADComputer SRV01 -Properties msDS-AllowedToDelegateTo)."msDS-AllowedToDelegateTo") { $ok=$false } } catch { $ok=$false }; '
+    fi
+    script+='if ($ok) { "OBJECTS_DONE" }'
+
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c "$script" 2>/dev/null | grep -q "OBJECTS_DONE"
+}
+
+check_dc01_av_update_gpo() {
     DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c \
-        "Get-ADComputer WS01 -Properties msDS-AllowedToActOnBehalfOfOtherIdentity" \
-        2>/dev/null | grep -q "WS01"
+        "Get-GPO -Name 'Disable AV and Windows Update'" 2>/dev/null | grep -q "Disable AV and Windows Update"
 }
 
 check_dc02_join() {
@@ -144,11 +187,21 @@ check_dc03_join() {
 }
 
 check_dc02_postboot() {
-    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc02 -c "Get-Service ADWS" 2>/dev/null | grep -q "Running"
+    # ADWS is already started during the JOIN step (dc02_join.ps1), so testing
+    # "Get-Service ADWS -eq Running" produced a FALSE POSITIVE that skipped
+    # postboot entirely — leaving ConfigurationStatus=1 (the Server Manager
+    # "Promote this server to a domain controller" banner), the Recycle-Bin
+    # prompt, and the SRV self-check unrun. Gate on postboot's real end-state:
+    # the ConfigurationStatus post-deployment flag flipped to 2.
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc02 -c \
+        "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10' -Name ConfigurationStatus -ErrorAction SilentlyContinue).ConfigurationStatus" 2>/dev/null | grep -q "2"
 }
 
 check_dc03_postboot() {
-    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc03 -c "Get-Service ADWS" 2>/dev/null | grep -q "Running"
+    # Same false-positive class as check_dc02_postboot (ADWS is started at join).
+    # Gate on the actual postboot outcome: ConfigurationStatus flipped to 2.
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc03 -c \
+        "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10' -Name ConfigurationStatus -ErrorAction SilentlyContinue).ConfigurationStatus" 2>/dev/null | grep -q "2"
 }
 
 check_srv01_services() {
@@ -160,13 +213,19 @@ check_ws01_misconfig() {
 }
 
 check_ws02_misconfig() {
-    vagrant winrm ws02 -c "Get-LocalUser localadmin" 2>/dev/null | grep -q "localadmin"
+    # WS02 doesn't create a localadmin; verify a real WS02 artifact instead —
+    # the AutoLogon-as-anakin registry value set by ws02_misconfig.ps1.
+    vagrant winrm ws02 -c "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').DefaultUserName" 2>/dev/null | grep -qi "anakin"
 }
 
 check_hardened() {
     local vm=$1
-    vagrant winrm "$vm" -c "Get-LocalUser vagrant | Select-Object Enabled" \
-        2>/dev/null | grep -q "False"
+    # Hardened == vagrant account is gone (deleted) OR present-but-disabled.
+    # After harden_windows.ps1 deletes the user, Get-LocalUser errors and prints
+    # nothing, so treat "not found" as hardened too.
+    local out
+    out=$(vagrant winrm "$vm" -c "if (Get-LocalUser vagrant -ErrorAction SilentlyContinue) { (Get-LocalUser vagrant).Enabled } else { 'Absent' }" 2>/dev/null)
+    echo "$out" | grep -qE "False|Absent"
 }
 
 ensure_adws() {
@@ -229,6 +288,7 @@ cmd_build_boxes() {
     log_info "Cleaning previous build artifacts..."
     VBoxManage unregistervm packer-windows-server-2022 --delete 2>/dev/null || true
     VBoxManage unregistervm packer-windows-10 --delete 2>/dev/null || true
+    VBoxManage unregistervm packer-debian-bookworm --delete 2>/dev/null || true
     rm -rf "$HOME/VirtualBox VMs/packer-windows-server-2022" 2>/dev/null || true
     rm -rf "$HOME/VirtualBox VMs/packer-windows-10" 2>/dev/null || true
     log_ok "Cleanup done"
@@ -307,6 +367,41 @@ cmd_build_boxes() {
         fi
     fi
 
+    # ── Build Debian Bookworm ──
+    if [ "$BUILD_DEBIAN" = true ]; then
+        echo ""
+        echo "[3] Building Debian Bookworm box..."
+        if [ ! -f "$DEBIAN_ISO" ]; then
+            echo "ERROR: ISO not found at: $DEBIAN_ISO"
+            echo "  Place your ISO in iso/ or set: export DEBIAN_ISO=/path/to/your.iso"
+            exit 1
+        fi
+        log_info "ISO: $DEBIAN_ISO"
+        log_info "Calculating checksum..."
+        local debian_checksum
+        debian_checksum=$(sha256sum "$DEBIAN_ISO" | cut -d' ' -f1)
+        log_info "SHA256: $debian_checksum"
+        echo "    Starting Packer build (10-20 minutes)..."
+
+        packer init "$SCRIPT_DIR/packer/debian-bookworm/" 2>/dev/null || true
+        packer build \
+            -var "iso_path=$DEBIAN_ISO" \
+            -var "iso_checksum=$debian_checksum" \
+            "$SCRIPT_DIR/packer/debian-bookworm/debian-bookworm.pkr.hcl"
+        if [ $? -ne 0 ]; then
+            echo "ERROR: Packer build failed for Debian Bookworm"
+            exit 1
+        fi
+
+        if [ "$SKIP_VAGRANT_ADD" = false ]; then
+            log_info "Adding to Vagrant..."
+            vagrant box remove secscope/debian-bookworm --force 2>/dev/null || true
+            vagrant box add --name secscope/debian-bookworm \
+                "$SCRIPT_DIR/packer/boxes/debian-bookworm.box"
+            log_ok "Debian Bookworm box added to Vagrant"
+        fi
+    fi
+
     local build_end=$(date +%s)
     local build_elapsed=$(( (build_end - build_start) / 60 ))
     echo ""
@@ -345,6 +440,79 @@ vm_selected() {
         [ "$s" = "$vm" ] && return 0
     done
     return 1
+}
+
+# True for Windows/Linux member VMs (not domain controllers).
+is_member() {
+    local vm=$1
+    for m in "${ALL_MEMBERS[@]}"; do
+        [ "$m" = "$vm" ] && return 0
+    done
+    return 1
+}
+
+# Strip stale NAT-range (10.0.2.*) A records and non-internal AAAA records from
+# DC01's secscope.corp zone. 10.0.2.15 is every VM's own NAT IP, so a leaked
+# "<dc> -> 10.0.2.15" record makes clients round-robin onto themselves and
+# breaks Kerberos/replication/joins. Safe + idempotent: only removes NAT-range
+# A / IPv6 records, never touches 192.168.200.x, machine accounts, or services.
+clean_nat_leak() {
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c '
+$zone = "secscope.corp"
+Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
+    $ip = $_.RecordData.IPv4Address.IPAddressToString
+    if ($ip -like "10.0.2.*") {
+        Write-Host "Removing: $($_.HostName) -> $ip"
+        dnscmd localhost /RecordDelete $zone $($_.HostName) A $ip /f 2>&1 | Out-Null
+    }
+}
+Get-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -ErrorAction SilentlyContinue | ForEach-Object {
+    dnscmd localhost /RecordDelete $zone $($_.HostName) AAAA $($_.RecordData.IPv6Address.IPAddressToString) /f 2>&1 | Out-Null
+}
+Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+' 2>/dev/null || true
+}
+
+# Remove stale child-domain (it.secscope.corp) metadata from the SURVIVING DC01
+# before DC03 (re)joins. When only the DC03 VM is destroyed, the forest keeps
+# the child-domain crossRef (CN=ITSEC,CN=Partitions,...), the 'it' NS delegation
+# and the it.secscope.corp forwarder zone, so Install-ADDSDomain aborts with
+# "The specified domain already exists". This self-heals a DC03 rebuild against
+# a running DC01/DC02. Safe + idempotent (only acts when the DC03 computer object
+# is absent, i.e. a real rebuild, so it never disturbs a healthy child domain).
+clean_stale_child_domain() {
+    log_info "Cleaning stale child-domain metadata on DC01 (for DC03 rebuild)..."
+    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c '
+$childDN = "DC=it,DC=secscope,DC=corp"
+$partitionsDN = "CN=Partitions,CN=Configuration,DC=secscope,DC=corp"
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+# Only clean when DC03 is genuinely gone (rebuild), not a healthy child domain.
+$dc03Present = $false
+try { if (Get-ADComputer -Identity "DC03" -ErrorAction Stop) { $dc03Present = $true } } catch {}
+if ($dc03Present) {
+    Write-Host "DC03 computer object present - leaving child domain intact"
+} else {
+    try {
+        $crossRefs = Get-ADObject -SearchBase $partitionsDN -SearchScope OneLevel -LDAPFilter "(objectClass=crossRef)" -Properties nCName -ErrorAction Stop | Where-Object { $_.nCName -eq $childDN }
+        foreach ($cr in $crossRefs) {
+            Remove-ADObject -Identity $cr.DistinguishedName -Recursive -Confirm:$false -ErrorAction Stop
+            Write-Host "Removed stale crossRef: $($cr.DistinguishedName)"
+        }
+        if (-not $crossRefs) { Write-Host "No stale crossRef" }
+    } catch { Write-Host "crossRef cleanup skipped: $_" }
+    Import-Module DnsServer -ErrorAction SilentlyContinue
+    Get-DnsServerResourceRecord -ZoneName "secscope.corp" -Name "it" -RRType NS -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-DnsServerResourceRecord -ZoneName "secscope.corp" -InputObject $_ -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed stale it NS delegation"
+    }
+    $fwd = Get-DnsServerZone -Name "it.secscope.corp" -ErrorAction SilentlyContinue
+    if ($fwd -and $fwd.ZoneType -eq "Forwarder") {
+        Remove-DnsServerZone -Name "it.secscope.corp" -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed stale it.secscope.corp forwarder zone"
+    }
+    Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+}
+' 2>/dev/null || true
 }
 
 # ── Step 1: DC01 base ──
@@ -407,19 +575,7 @@ step_dc01_dns() {
     fi
 
     log_info "Cleaning stale NAT DNS records..."
-    DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant winrm dc01 -c '
-$zone = "secscope.corp"
-Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
-    $ip = $_.RecordData.IPv4Address.IPAddressToString
-    if ($ip -like "10.0.2.*") {
-        Write-Host "Removing: $($_.HostName) -> $ip"
-        dnscmd localhost /RecordDelete $zone $($_.HostName) A $ip /f 2>&1 | Out-Null
-    }
-}
-Get-DnsServerResourceRecord -ZoneName $zone -RRType AAAA -ErrorAction SilentlyContinue | ForEach-Object {
-    dnscmd localhost /RecordDelete $zone $($_.HostName) AAAA $($_.RecordData.IPv6Address.IPAddressToString) /f 2>&1 | Out-Null
-}
-' 2>/dev/null || true
+    clean_nat_leak
     log_ok "NAT DNS cleanup done"
 }
 
@@ -433,6 +589,22 @@ step_dc01_objects_base() {
     fi
     run_vagrant vagrant provision dc01 --provision-with objects-base || { log_err "objects-base failed"; exit 1; }
     EXECUTED_STEPS+=("DC01 objects (base)")
+}
+
+# ── Step: DC01 AV/Update disable GPO (opt-in via --disable-av-update) ──
+step_dc01_av_update_gpo() {
+    if [ "$AV_UPDATE_GPO" != true ]; then
+        SKIPPED_STEPS+=("AV/Update GPO")
+        return
+    fi
+    log_step "[+] DC01 GPO — disable Defender AV and Windows Update (all machines)..."
+    if check_dc01_av_update_gpo; then
+        log_skip "AV/Update GPO already present"
+        SKIPPED_STEPS+=("AV/Update GPO")
+        return
+    fi
+    run_vagrant vagrant provision dc01 --provision-with avupdate-gpo || { log_err "AV/Update GPO failed"; exit 1; }
+    EXECUTED_STEPS+=("AV/Update GPO")
 }
 
 # ── Step 5: Boot remaining VMs in parallel ──
@@ -475,9 +647,12 @@ step_boot_remaining() {
 }
 
 # ── Step: sysprep (generate unique SIDs) ──
+# The Packer base box ships with a machine SID identical to the domain's, so
+# EVERY VM built from it (DCs and members alike) must sysprep /generalize before
+# it can join/promote, or Add-Computer/Install-ADDS* fails with "SID identical".
 step_sysprep() {
     local sysprep_vms=()
-    for vm in dc02 dc03; do
+    for vm in dc02 dc03 srv01 ws01 ws02; do
         if ! vm_selected "$vm"; then continue; fi
         sysprep_vms+=("$vm")
     done
@@ -496,18 +671,35 @@ step_sysprep() {
             SKIPPED_STEPS+=("Sysprep $vm")
             continue
         fi
+        # Members: if already domain-joined (role 1=member workstation, 3=member
+        # server), the SID work is done — don't re-sysprep.
+        if is_member "$vm" && [ "$role" -ge 1 ] 2>/dev/null && [ "$role" -ne 2 ] 2>/dev/null; then
+            log_skip "$vm already domain-joined (role $role), skipping sysprep"
+            SKIPPED_STEPS+=("Sysprep $vm")
+            continue
+        fi
         log_step "[sysprep] Generating new SID on $vm..."
         vagrant provision "$vm" --provision-with sysprep 2>&1 | filter_winrm || true
         log_info "Sysprep launched on $vm, machine will reboot. Waiting for OOBE..."
+        # /generalize reboots into OOBE and drops WinRM. sysprep_sid.ps1 preserves
+        # the computer name from COMPUTERNAME at sysprep time (the base-box name
+        # for a member, e.g. VAGRANT-BUILD); a member is not renamed to "$vm"
+        # until the join step. So we must NOT gate readiness on the hostname
+        # matching "$vm". Instead wait for WinRM to go DOWN (reboot started), then
+        # wait for it to come back up.
+        for i in $(seq 1 18); do
+            vagrant winrm "$vm" -c "exit 0" 2>/dev/null || break
+            sleep 5
+        done
         local online=false
-        for i in $(seq 1 12); do
+        for i in $(seq 1 30); do
             sleep 10
-            if vagrant winrm "$vm" -c "hostname" 2>/dev/null | grep -qi "$vm"; then
+            if vagrant winrm "$vm" -c "exit 0" 2>/dev/null; then
                 log_ok "$vm back online after sysprep ($((i*10))s)"
                 online=true
                 break
             fi
-            log_verbose "    $vm sysprep wait $i/12..."
+            log_verbose "    $vm sysprep wait $i/30..."
         done
         if [ "$online" = false ]; then
             log_err "$vm did not come back after sysprep"
@@ -515,8 +707,14 @@ step_sysprep() {
         fi
         log_info "Running vagrant reload on $vm to stabilize..."
         vagrant reload "$vm" --force
-        log_info "Re-applying base config (IP) on $vm..."
-        vagrant provision "$vm" --provision-with base 2>&1 | filter_winrm || true
+        # DCs get their static IP re-applied by the dedicated 'base' provisioner
+        # after sysprep. Members have no 'base' provisioner — domain_join.ps1
+        # (run later in step_member_join) sets the static IP and re-enables the
+        # sysprep-disabled internal NIC.
+        if ! is_member "$vm"; then
+            log_info "Re-applying base config (IP) on $vm..."
+            vagrant provision "$vm" --provision-with base 2>&1 | filter_winrm || true
+        fi
         EXECUTED_STEPS+=("Sysprep $vm")
     done
 }
@@ -564,6 +762,7 @@ step_dc_joins() {
             log_skip "DC03 already a DC"
             SKIPPED_STEPS+=("DC03 join")
         else
+            clean_stale_child_domain
             (
                 vagrant provision dc03 --provision-with join 2>&1 | filter_winrm || true
                 export DC_WINRM_PASSWORD="$ADMIN_PASS"
@@ -635,6 +834,71 @@ step_dc03_postboot() {
         DC_WINRM_PASSWORD="$ADMIN_PASS" vagrant provision dc03 --provision-with postboot 2>&1 | filter_winrm || log_warn "DC03 postboot had warnings (non-critical)"
     }
     EXECUTED_STEPS+=("DC03 postboot")
+}
+
+# ── Step 7.5: Windows member domain joins (srv01, ws01, ws02) ──
+# Members must be sysprepped (step_sysprep) BEFORE this so their machine SID is
+# unique. domain_join.ps1 sets the static IP, re-enables the sysprep-disabled
+# internal NIC, and joins; the reload finalizes the join + computer rename.
+# Runs after the DCs are up so DNS/Kerberos resolve, and BEFORE
+# step_dc01_objects_final (which needs the joined computer objects to set the
+# RBCD / delegation ACLs).
+step_member_join() {
+    local win_members=(srv01 ws01 ws02)
+    local any=false
+    for vm in "${win_members[@]}"; do
+        if vm_selected "$vm"; then any=true; break; fi
+    done
+    if [ "$any" = false ]; then
+        SKIPPED_STEPS+=("Member joins")
+        return
+    fi
+
+    # Clear any recurring NAT leak on DC01 first so members don't resolve a DC
+    # to 10.0.2.15 during the join.
+    log_info "Pre-join NAT DNS cleanup on DC01..."
+    clean_nat_leak
+
+    local join_failures=0
+    for vm in "${win_members[@]}"; do
+        if ! vm_selected "$vm"; then continue; fi
+        log_step "[7.5] $vm domain join..."
+        local role
+        role=$(vagrant winrm "$vm" -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | tr -d '\r\n ')
+        if [ "$role" = "1" ] || [ "$role" = "3" ]; then
+            log_skip "$vm already domain-joined (role $role)"
+            SKIPPED_STEPS+=("$vm join")
+            continue
+        fi
+        vagrant provision "$vm" --provision-with join 2>&1 | filter_winrm || { log_err "$vm join failed"; ((join_failures++)); continue; }
+        log_info "Rebooting $vm to finalize domain join..."
+        # The post-join reload occasionally trips Vagrant's boot_timeout when
+        # WinRM is slow to come back after the domain-join reboot. That is a
+        # transient race, not a real failure, so retry the reload a few times
+        # (re-confirming the joined role each time) before giving up.
+        local reload_ok=false
+        for attempt in 1 2 3; do
+            vagrant reload "$vm" --force 2>&1 | filter_winrm || true
+            role=$(vagrant winrm "$vm" -c "(Get-CimInstance Win32_ComputerSystem).DomainRole" 2>/dev/null | tr -d '\r\n ')
+            if [ "$role" = "1" ] || [ "$role" = "3" ]; then
+                reload_ok=true
+                break
+            fi
+            log_warn "$vm not domain-joined after reload attempt $attempt/3 (role=$role); retrying..."
+            sleep 10
+        done
+        if [ "$reload_ok" = true ]; then
+            log_ok "$vm joined secscope.corp (role $role)"
+            EXECUTED_STEPS+=("$vm join")
+        else
+            log_err "$vm did not reach a domain-joined role (role=$role)"
+            ((join_failures++))
+        fi
+    done
+    if [ $join_failures -gt 0 ]; then
+        log_err "$join_failures member join(s) failed"
+        exit 1
+    fi
 }
 
 # ── Step 8+9+10: SRV01 services, WS01/WS02 misconfig in parallel ──
@@ -760,13 +1024,88 @@ step_hardening() {
     EXECUTED_STEPS+=("Harden")
 }
 
-# ── Deploy orchestrator ──
+# ── Step 13: Seal network (default ON for full builds; --no-seal to disable) ──
+# Removes nic1 (VirtualBox NAT, 10.0.2.x) from each selected VM so every machine
+# is left with a single internal IP on the SECSCOPE.CORP NAT network
+# (192.168.200.x). This permanently eliminates the NAT-leak class of DNS bugs.
+#
+# WARNING: this severs ALL Vagrant management (WinRM/SSH) and RDP port-forwards,
+# which ride nic1. It is therefore the LAST step, after hardening (the final
+# comms operation). Internet still works via the NAT Network on nic2. Access
+# afterwards is via the VirtualBox console or an in-network host (e.g. Kali .99).
+# Reversible only by re-adding nic1: VBoxManage modifyvm <name> --nic1 nat.
+step_seal_network() {
+    if [ "$SEAL_NETWORK" != true ]; then
+        SKIPPED_STEPS+=("Seal network")
+        return
+    fi
+    # Sealing severs all Vagrant/WinRM/RDP management. On a scoped run (a partial
+    # --vms subset) that would cut management mid-workflow and leave the rest of
+    # the lab unreachable for later steps, so auto-seal is limited to FULL builds.
+    # A partial run only seals when the user explicitly passed --seal-network.
+    if [ ${#SELECTED_VMS[@]} -gt 0 ] && [ "$SEAL_EXPLICIT" != true ]; then
+        log_skip "Seal network (scoped run; pass --seal-network to force, --no-seal to silence)"
+        SKIPPED_STEPS+=("Seal network")
+        return
+    fi
+    log_step "[13/14] Sealing network — removing NAT adapter (single IP per VM)..."
+    log_warn "This removes Vagrant/RDP access. Machines will be reachable only via the"
+    log_warn "VirtualBox console or an in-network host (Kali .99) after this step."
+
+    local sealed=0
+    local seal_failures=0
+    for vm in "${ALL_VMS[@]}"; do
+        if ! vm_selected "$vm"; then continue; fi
+        if [ "$vm" = "lin01" ] && [ "$SKIP_LINUX" = true ]; then continue; fi
+
+        local vbox_name
+        vbox_name="$(echo "$vm" | tr '[:lower:]' '[:upper:]').SECSCOPE.CORP"
+
+        # Last-chance verification: confirm the internal 192.168.200.x IP is present
+        # before we cut management off. Best-effort (comms are about to die anyway).
+        if [ "$vm" != "lin01" ]; then
+            local ipcheck
+            ipcheck=$(vagrant winrm "$vm" -c "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -like '192.168.200.*' }).IPAddress" 2>/dev/null | tr -d '\r')
+            if echo "$ipcheck" | grep -q "192.168.200."; then
+                log_ok "$vm internal IP present ($(echo "$ipcheck" | tr '\n' ' '))"
+            else
+                log_warn "$vm internal 192.168.200.x IP not confirmed — sealing anyway"
+            fi
+        fi
+
+        log_info "Halting $vm..."
+        vagrant halt "$vm" 2>&1 | filter_winrm || true
+
+        log_info "Removing nic1 (NAT) from $vbox_name..."
+        if VBoxManage modifyvm "$vbox_name" --nic1 none 2>/dev/null; then
+            log_ok "$vm nic1 removed — now single-homed on SECSCOPE.CORP"
+        else
+            log_warn "Could not modify $vbox_name (name mismatch or VM missing)"
+            ((seal_failures++))
+            continue
+        fi
+
+        log_info "Booting $vm headless..."
+        VBoxManage startvm "$vbox_name" --type headless 2>/dev/null || \
+            log_warn "Could not start $vbox_name — start it manually from VirtualBox"
+        ((sealed++))
+    done
+
+    if [ $seal_failures -gt 0 ]; then
+        log_warn "Network seal completed with $seal_failures issue(s); $sealed VM(s) sealed"
+    else
+        log_ok "Network seal complete — $sealed VM(s) single-homed on SECSCOPE.CORP"
+    fi
+    EXECUTED_STEPS+=("Seal network")
+}
 cmd_deploy() {
     echo "╔══════════════════════════════════════════╗"
     echo "║  Active Directory Alligator Labs — Setup ║"
     echo "╚══════════════════════════════════════════╝"
 
     preflight
+
+    export SKIP_NLA_FIX
 
     # ── Sequential deploy pipeline ──
     step_dc01_base
@@ -776,10 +1115,12 @@ cmd_deploy() {
 
     step_dc01_objects_base
 
+    step_dc01_av_update_gpo
+
     if [ "$DC01_ONLY" = true ]; then
         echo ""
         log_info "--dc01-only set — stopping after DC01 build"
-        SKIPPED_STEPS+=("DC02 join" "DC03 join" "SRV01 services" "WS01 misconfig" "WS02 misconfig" "DC01 objects (final)" "Harden")
+        SKIPPED_STEPS+=("DC02 join" "DC03 join" "Member joins" "SRV01 services" "WS01 misconfig" "WS02 misconfig" "DC01 objects (final)" "Harden")
         local end_time=$(date +%s)
         local elapsed=$((end_time - START_TIME))
         echo ""
@@ -794,9 +1135,11 @@ cmd_deploy() {
     export DC_WINRM_PASSWORD="$ADMIN_PASS"
     step_dc02_postboot
     step_dc03_postboot
+    step_member_join
     step_member_provisioning
     step_dc01_objects_final
     step_hardening
+    step_seal_network
 
     # ── Summary ──
     local end_time=$(date +%s)
@@ -854,13 +1197,27 @@ show_help() {
     echo "  --skip-misconfig     Skip WS01/WS02 misconfigurations"
     echo "  --skip-hardening     Skip vagrant account hardening"
     echo "  --skip-linux         Skip LIN01"
+    echo "  --skip-nla-fix       Skip NLA domain-detection startup task"
+    echo "  --disable-av-update  Create a domain GPO (linked at the root) that"
+    echo "                       disables Windows Defender AV and Windows Update"
+    echo "                       on all domain-joined machines. Default OFF."
+    echo "  --seal-network       Force network seal (default ON for full builds):"
+    echo "                       remove NAT nic1 so each VM has a single"
+    echo "                       192.168.200.x IP. Cuts Vagrant/RDP access - use"
+    echo "                       the VirtualBox console or Kali (.99) afterwards."
+    echo "                       Auto-skipped on scoped (--vms) runs unless forced."
+    echo "  --no-seal            Disable the network seal (keep NAT nic1 for"
+    echo "                       continued Vagrant/RDP management)."
     echo ""
     echo "BUILD-BOXES OPTIONS:"
     echo "  --server-only        Build only Windows Server 2022 box"
     echo "  --workstation-only   Build only Windows 10 box"
+    echo "  --debian-only        Build only Debian Bookworm box"
+    echo "  --skip-debian        Skip Debian (build Windows boxes only)"
     echo "  --no-vagrant-add     Build boxes but don't add to Vagrant"
     echo "  --server-iso <path>  Custom Server 2022 ISO path"
     echo "  --win10-iso <path>   Custom Windows 10 ISO path"
+    echo "  --debian-iso <path>  Custom Debian ISO path"
     echo ""
     echo "OUTPUT OPTIONS:"
     echo "  -v, --verbose        Show all provisioning output"
@@ -870,11 +1227,14 @@ show_help() {
     echo ""
     echo "EXAMPLES:"
     echo "  ./setup.sh                              Full deploy (all VMs)"
+    echo "  ./setup.sh --no-seal                    Full deploy, keep NAT nic1 (manageable)"
     echo "  ./setup.sh deploy --vms dc01,ws01       Deploy only DC01 and WS01"
     echo "  ./setup.sh deploy --dc01-only           Deploy DC01 only"
     echo "  ./setup.sh deploy --skip-misconfig      Deploy without WS vulns"
+    echo "  ./setup.sh deploy --disable-av-update   Deploy + GPO disabling AV/Updates"
     echo "  ./setup.sh deploy --verbose             Full output"
     echo "  ./setup.sh build-boxes --server-only    Build Server 2022 box only"
+    echo "  ./setup.sh build-boxes --debian-only    Build Debian box only"
     echo "  ./setup.sh destroy                      Destroy everything"
     echo "  ./setup.sh status                       Show VM states"
     echo ""
@@ -955,11 +1315,33 @@ while [ $i -lt ${#ARGS[@]} ]; do
         --skip-linux)
             SKIP_LINUX=true
             ;;
+        --skip-nla-fix)
+            SKIP_NLA_FIX=true
+            ;;
+        --disable-av-update)
+            AV_UPDATE_GPO=true
+            ;;
+        --seal-network)
+            SEAL_NETWORK=true
+            SEAL_EXPLICIT=true
+            ;;
+        --no-seal|--no-seal-network)
+            SEAL_NETWORK=false
+            SEAL_EXPLICIT=true
+            ;;
         --server-only)
             BUILD_WIN10=false
             ;;
         --workstation-only)
             BUILD_SERVER=false
+            ;;
+        --debian-only)
+            BUILD_SERVER=false
+            BUILD_WIN10=false
+            BUILD_DEBIAN=true
+            ;;
+        --skip-debian)
+            BUILD_DEBIAN=false
             ;;
         --no-vagrant-add)
             SKIP_VAGRANT_ADD=true
@@ -971,6 +1353,10 @@ while [ $i -lt ${#ARGS[@]} ]; do
         --win10-iso)
             ((i++))
             WIN10_ISO="${ARGS[$i]}"
+            ;;
+        --debian-iso)
+            ((i++))
+            DEBIAN_ISO="${ARGS[$i]}"
             ;;
         *)
             echo "Unknown option: $arg"

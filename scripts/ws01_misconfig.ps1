@@ -64,6 +64,16 @@ if ($hanLogonOk) {
     Write-Host "[ws01_misconfig] WARNING: interactive LogonUser failed for han (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
 }
 
+Write-Host "[ws01_misconfig] Seeding Domain Cached Credentials (DCC2) for SECSCOPE\anakin (AutoLogon offline fallback)..."
+[IntPtr]$anakinToken = [IntPtr]::Zero
+$anakinLogonOk = [CachedLogonHelper]::LogonUser("anakin", "SECSCOPE", "Vader2024!", $LOGON32_LOGON_INTERACTIVE, $LOGON32_PROVIDER_DEFAULT, [ref]$anakinToken)
+if ($anakinLogonOk) {
+    [CachedLogonHelper]::CloseHandle($anakinToken) | Out-Null
+    Write-Host "[ws01_misconfig] anakin's DCC2 verifier cached - AutoLogon will now survive early-boot domain unavailability"
+} else {
+    Write-Host "[ws01_misconfig] WARNING: interactive LogonUser failed for anakin (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+}
+
 Write-Host "[ws01_misconfig] Planting credentials in PowerShell history..."
 $histPath = "C:\Users\anakin\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine"
 New-Item -ItemType Directory -Force -Path $histPath | Out-Null
@@ -87,6 +97,7 @@ Set-ItemProperty -Path $winlogon -Name AutoAdminLogon -Value "1" -Type String -F
 Set-ItemProperty -Path $winlogon -Name DefaultUserName -Value "anakin" -Type String -Force
 Set-ItemProperty -Path $winlogon -Name DefaultDomainName -Value "SECSCOPE" -Type String -Force
 Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value "Vader2024!" -Type String -Force
+Set-ItemProperty -Path $winlogon -Name AutoLogonCount -Value 5 -Type DWord -Force
 Write-Host "[ws01_misconfig] WS01 will now boot to anakin's desktop (not local Administrator)"
 
 Write-Host "[ws01_misconfig] Done"

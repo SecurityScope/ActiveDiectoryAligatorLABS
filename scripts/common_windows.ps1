@@ -56,4 +56,58 @@ try {
 Write-Host "[common] Ensuring AD Web Services available..."
 Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
 
+# ── Durable NLA domain-detection fix ────────────────────────────────────────
+# NLA classifies the network at NIC link-up, before Netlogon/DNS can verify
+# domain trust, then caches "Private"/"Public" and never retries on its own.
+# The provisioning scripts bounce the internal adapter once, but that does NOT
+# survive later reboots. Register an AtStartup task that re-triggers NLA ~30s
+# after boot so the internal (192.168.x) profile flips to DomainAuthenticated
+# without any manual adapter toggling, on every reboot.
+#
+# Notes learned the hard way:
+#  - Register-ScheduledTask over WinRM can create an orphaned task (task file
+#    on disk but no TaskCache registry entry, wrong LogonType) that vanishes on
+#    reboot. schtasks.exe /create is reliable across the WinRM channel.
+#  - schtasks /tr is capped at 261 chars, so the logic lives in a helper file.
+#  - Restart-NetAdapter is NOT a strong enough NLA re-classification trigger
+#    here; a full Disable/Enable cycle is required to flip the category. WinRM
+#    rides the NAT adapter, so bouncing the internal adapter is session-safe.
+if ($env:SKIP_NLA_FIX -eq "true") {
+    Write-Host "[common] SKIP_NLA_FIX set - skipping NLA-Recheck task registration"
+} elseif (Get-ScheduledTask -TaskName "NLA-Recheck" -ErrorAction SilentlyContinue) {
+    Write-Host "[common] NLA-Recheck scheduled task already present"
+} else {
+    Write-Host "[common] Registering NLA-Recheck startup task..."
+    $nlaDir    = "C:\ProgramData\SecScope"
+    $nlaScript = Join-Path $nlaDir "nla_recheck.ps1"
+    New-Item -ItemType Directory -Path $nlaDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $nlaBody = @'
+try { Restart-Service NlaSvc -Force -ErrorAction Stop } catch {}
+Start-Sleep 5
+$internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {
+    (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*"
+} | Select-Object -First 1
+if ($internal) {
+    $cat = (Get-NetConnectionProfile -InterfaceAlias $internal.Name -ErrorAction SilentlyContinue).NetworkCategory
+    if ($cat -ne "DomainAuthenticated") {
+        Disable-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep 5
+        Enable-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+'@
+    Set-Content -Path $nlaScript -Value $nlaBody -Encoding UTF8
+    $tr = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $nlaScript"
+    schtasks.exe /create /tn "NLA-Recheck" /ru "SYSTEM" /sc ONSTART /delay 0000:30 /rl HIGHEST /f /tr $tr 2>&1 | Out-Null
+    if (Get-ScheduledTask -TaskName "NLA-Recheck" -ErrorAction SilentlyContinue) {
+        Write-Host "[common] NLA-Recheck task registered"
+    } else {
+        Write-Host "[common] WARNING: NLA-Recheck task registration failed"
+    }
+}
+
+# ── NLA fix verification block ──
+Get-Service NlaSvc,Netlogon -ErrorAction SilentlyContinue | Select-Object Name,StartType,Status | Format-Table -Auto | Out-String | Write-Host
+Get-NetConnectionProfile -ErrorAction SilentlyContinue | Select-Object InterfaceAlias,NetworkCategory | Format-Table -Auto | Out-String | Write-Host
+
 Write-Host "[common] Done"

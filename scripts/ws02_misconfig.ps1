@@ -21,12 +21,36 @@ Write-Host "[ws02_misconfig] Spooler service started"
 
 Write-Host "[ws02_misconfig] NOTE: Unconstrained delegation on WS02 is set in AD by dc01_objects.ps1"
 
+Write-Host "[ws02_misconfig] Seeding Domain Cached Credentials (DCC2) for SECSCOPE\anakin (AutoLogon offline fallback)..."
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class CachedLogonHelper {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool LogonUser(string lpszUsername, string lpszDomain, string lpszPassword,
+        int dwLogonType, int dwLogonProvider, out IntPtr phToken);
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+"@
+$LOGON32_LOGON_INTERACTIVE = 2
+$LOGON32_PROVIDER_DEFAULT = 0
+[IntPtr]$anakinToken = [IntPtr]::Zero
+$anakinLogonOk = [CachedLogonHelper]::LogonUser("anakin", "SECSCOPE", "Vader2024!", $LOGON32_LOGON_INTERACTIVE, $LOGON32_PROVIDER_DEFAULT, [ref]$anakinToken)
+if ($anakinLogonOk) {
+    [CachedLogonHelper]::CloseHandle($anakinToken) | Out-Null
+    Write-Host "[ws02_misconfig] anakin's DCC2 verifier cached - AutoLogon will now survive early-boot domain unavailability"
+} else {
+    Write-Host "[ws02_misconfig] WARNING: interactive LogonUser failed for anakin (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+}
+
 Write-Host "[ws02_misconfig] Configuring interactive AutoLogon as SECSCOPE\anakin..."
 $winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 Set-ItemProperty -Path $winlogon -Name AutoAdminLogon -Value "1" -Type String -Force
 Set-ItemProperty -Path $winlogon -Name DefaultUserName -Value "anakin" -Type String -Force
 Set-ItemProperty -Path $winlogon -Name DefaultDomainName -Value "SECSCOPE" -Type String -Force
 Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value "Vader2024!" -Type String -Force
+Set-ItemProperty -Path $winlogon -Name AutoLogonCount -Value 5 -Type DWord -Force
 Write-Host "[ws02_misconfig] WS02 will now boot to anakin's desktop (not local Administrator) - required for the unconstrained delegation TGT-capture scenario"
 
 Write-Host "[ws02_misconfig] Done"

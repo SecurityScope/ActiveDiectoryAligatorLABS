@@ -151,6 +151,7 @@ Windows boxes must be built from ISO before any VMs can be started.
 |-----|----------|-------------------|--------|
 | Windows Server 2022 | [Direct download](https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso) | `SERVER_EVAL_x64FRE_en-us.iso` | `3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325` |
 | Windows 10 22H2 | [Download page](https://www.microsoft.com/en-us/software-download/windows10ISO) | `Win10_22H2_English_x64v1.iso` | `a6f470ca6d331eb353b815c043e327a347f594f37ff525f17764738fe812852e` |
+| Debian 12.15.0 | [Direct download](https://laotzu.ftp.acc.umu.se/cdimage/archive/12.15.0/amd64/iso-cd/debian-12.15.0-amd64-netinst.iso) | `debian-12.15.0-amd64-netinst.iso` | `cd4462c06aa8892e692c0c4b9c17802f38c8ab8690e85cbfb5ccaa5956e9af17` |
 
 Download the ISOs, rename them to match the expected filenames above, and place them
 in the `iso/` directory. Verify the checksums match:
@@ -173,7 +174,7 @@ Get-FileHash -Algorithm SHA256 iso\Win10_22H2_English_x64v1.iso
 
 ### Build Boxes
 
-Build the Windows boxes sequentially:
+Build the Windows and Debian boxes sequentially:
 
 ```bash
 # Build Windows Server 2022 box (~45-90 minutes)
@@ -181,6 +182,9 @@ Build the Windows boxes sequentially:
 
 # Build Windows 10 box (~45-90 minutes)
 ./setup.sh build-boxes --workstation-only
+
+# Build Debian Bookworm box (~10-20 minutes)
+./setup.sh build-boxes --debian-only
 ```
 
 Or build both at once:
@@ -200,11 +204,10 @@ vagrant box list | grep secscope
 
 Should show:
 ```
+secscope/debian-bookworm           (virtualbox, x.x.x)
 secscope/windows-10                (virtualbox, x.x.x)
 secscope/windows-server-2022       (virtualbox, x.x.x)
 ```
-
-Debian (`debian/bookworm64`) for lin01 is auto-downloaded from Vagrant Cloud on first `vagrant up`.
 
 If a `vagrant up` fails with "box not found", run `./setup.sh build-boxes` first.
 
@@ -441,6 +444,7 @@ Tools installed automatically on each VM by provisioning scripts:
 | Install VirtualBox + Vagrant | 10-15 min |
 | Build Windows Server 2022 box | 45-90 min |
 | Build Windows 10 box | 45-90 min |
+| Build Debian Bookworm box | 10-20 min |
 | Deploy lab (./setup.sh) | 75-90 min |
 | Kali VM setup | 15-20 min |
 | **Total (excluding box builds)** | **~2 hours** |
@@ -526,7 +530,7 @@ vagrant provision dc01 --provision-with objects
 ./setup.sh destroy
 vagrant box remove secscope/windows-server-2022
 vagrant box remove secscope/windows-10
-vagrant box remove debian/bookworm64
+vagrant box remove secscope/debian-bookworm
 ```
 
 ### Full rebuild from scratch

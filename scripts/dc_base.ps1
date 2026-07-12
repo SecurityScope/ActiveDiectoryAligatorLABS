@@ -24,13 +24,29 @@ if ($nic2) {
     netsh interface ip set address name="$nic2Name" static $dcIP 255.255.255.0 192.168.200.1
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
-    Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
+    # Internal (natnetwork) adapter must register its connection address so
+    # Netlogon can publish DC-locator SRV records after promotion. Disabling
+    # this causes "No DNS servers configured for local system" and SRV
+    # registration silently fails.
+    Set-DnsClient -InterfaceIndex $ifIndex -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $true
     # Prefer natnetwork adapter for DNS (lower metric = higher priority)
     Set-NetIPInterface -InterfaceIndex $ifIndex -InterfaceMetric 10
     $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
     foreach ($o in $otherNics) {
         Set-NetIPInterface -InterfaceIndex $o.InterfaceIndex -InterfaceMetric 200
         Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false
+        # The NAT adapter is DHCP-enabled; a DHCP renewal during the promotion
+        # window (Install-ADDSForest, before dc01_dns.ps1 runs) can transiently
+        # re-assert DNS registration via DHCP option 81 and let Netlogon publish
+        # a stale "<dc> -> 10.0.2.x" A record into the fresh zone. Pin the
+        # per-interface registry flag so registration stays off across DHCP
+        # renewals, not just at the DNS-client layer.
+        $guid = (Get-NetAdapter -InterfaceIndex $o.InterfaceIndex).InterfaceGuid
+        $ifKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
+        if (Test-Path $ifKey) {
+            Set-ItemProperty -Path $ifKey -Name RegistrationEnabled -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $ifKey -Name DisableDynamicUpdate -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        }
     }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"
     Write-Host "[$logPrefix] Waiting for network profile..."

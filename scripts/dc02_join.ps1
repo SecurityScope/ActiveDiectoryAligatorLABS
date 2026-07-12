@@ -66,14 +66,12 @@ try {
 Write-Host "[dc02_join] Verifying SRV records for $domain..."
 $srvOk = $false
 for ($i = 1; $i -le 6; $i++) {
-    try {
-        $srv = Resolve-DnsName "_ldap._tcp.$domain" -Type SRV -ErrorAction Stop
-        if ($srv) {
-            Write-Host "[dc02_join] SRV record found: $($srv.NameTarget):$($srv.Port)"
-            $srvOk = $true
-            break
-        }
-    } catch { }
+    $result = nslookup -type=srv "_ldap._tcp.$domain" $dc01IP 2>&1
+    if ($result -match "svr hostname") {
+        Write-Host "[dc02_join] SRV record found via nslookup"
+        $srvOk = $true
+        break
+    }
     Write-Host "[dc02_join] SRV lookup attempt $i/6, waiting..."
     Start-Sleep 5
 }
@@ -139,7 +137,15 @@ Start-Service ADWS -ErrorAction SilentlyContinue
 Write-Host "[dc02_join] Disabling IPv6 DNS registration..."
 Get-NetAdapter | ForEach-Object {
     Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
-    Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+    # Keep IPv4 connection registration on the internal (192.168.x) adapter so
+    # Netlogon can publish DC02's DC-locator SRV records; only disable it on
+    # the NAT adapter to keep its WAN IP out of the AD DNS zones.
+    $ip = (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    if ($ip -notlike "192.168.*") {
+        Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+    } else {
+        Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $true -ErrorAction SilentlyContinue
+    }
 }
 Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
 

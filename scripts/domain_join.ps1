@@ -10,21 +10,52 @@ $logPrefix  = $env:LOG_PREFIX
 Write-Host "[$logPrefix] Starting $vmName join setup..."
 
 Write-Host "[$logPrefix] Setting static IP $vmIP..."
+# sysprep /generalize (used to give members a unique machine SID) leaves the
+# second virtual NIC in a CM_PROB_DISABLED state. When that happens the internal
+# natnetwork adapter shows as "Not Present"/disabled after reboot, so the static
+# IP never applies and the domain is unreachable. Re-enable any disabled net
+# device before we look for the internal adapter.
+$disabledNet = Get-PnpDevice -Class Net -Status Error -ErrorAction SilentlyContinue |
+    Where-Object { $_.FriendlyName -like "*Ethernet*" -or $_.FriendlyName -like "*Intel*" -or $_.FriendlyName -like "*PRO/1000*" }
+foreach ($d in $disabledNet) {
+    Write-Host "[$logPrefix] Re-enabling disabled network device: $($d.FriendlyName)"
+    Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+}
+if ($disabledNet) { Start-Sleep 8 }
+
 $adapters = Get-NetAdapter | Where-Object Status -eq 'Up'
 $mgmtNic  = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).InterfaceIndex
 $nic2     = $adapters | Where-Object { $_.InterfaceIndex -ne $mgmtNic } | Select-Object -First 1
 
 if ($nic2) {
     $ifIndex = $nic2.InterfaceIndex
+    $nic2Name = $nic2.Name
     Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress $vmIP -PrefixLength 24 -DefaultGateway 192.168.200.1 -AddressFamily IPv4 -PolicyStore PersistentStore
+    netsh interface ip set address name="$nic2Name" static $vmIP 255.255.255.0 192.168.200.1
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dc01IP
+    Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled -ErrorAction SilentlyContinue
+    Set-NetIPInterface -InterfaceIndex $ifIndex -InterfaceMetric 10 -ErrorAction SilentlyContinue
+    # Keep the NAT (10.0.2.x) adapter from registering its address in AD DNS so
+    # a member never publishes a stale "<host> -> 10.0.2.15" A record.
+    $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
+    foreach ($o in $otherNics) {
+        Set-NetIPInterface -InterfaceIndex $o.InterfaceIndex -InterfaceMetric 200 -ErrorAction SilentlyContinue
+        Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
+        $guid = (Get-NetAdapter -InterfaceIndex $o.InterfaceIndex).InterfaceGuid
+        $ifKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
+        if (Test-Path $ifKey) {
+            Set-ItemProperty -Path $ifKey -Name RegistrationEnabled -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $ifKey -Name DisableDynamicUpdate -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dc01IP"
 } else {
     Write-Host "[$logPrefix] WARNING: Could not find secondary adapter"
     $idx = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceIndex
-    New-NetIPAddress -InterfaceIndex $idx -IPAddress $vmIP -PrefixLength 24 -DefaultGateway 192.168.200.1 -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+    $idxName = (Get-NetAdapter -InterfaceIndex $idx).Name
+    netsh interface ip set address name="$idxName" static $vmIP 255.255.255.0 192.168.200.1
     Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dc01IP
+    Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
     $ifIndex = $idx
 }
 

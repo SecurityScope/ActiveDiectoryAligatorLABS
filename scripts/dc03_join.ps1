@@ -52,15 +52,14 @@ if (-not (Select-String -Path "$env:windir\System32\drivers\etc\hosts" `
 Write-Host "[dc03_join] Verifying DNS resolution of secscope.corp..."
 $dnsOk = $false
 for ($i = 1; $i -le 6; $i++) {
-    try {
-        $resolved = Resolve-DnsName "secscope.corp" -ErrorAction Stop
-        Write-Host "[dc03_join] secscope.corp resolved to: $($resolved.IPAddress)"
+    $result = nslookup "secscope.corp" $dc01IP 2>&1
+    if ($result -match "Address" -and $result -match $dc01IP) {
+        Write-Host "[dc03_join] secscope.corp resolved via nslookup"
         $dnsOk = $true
         break
-    } catch {
-        Write-Host "[dc03_join] DNS resolution attempt $i/6, waiting..."
-        Start-Sleep 3
     }
+    Write-Host "[dc03_join] DNS resolution attempt $i/6, waiting..."
+    Start-Sleep 3
 }
 if (-not $dnsOk) {
     Write-Host "[dc03_join] ERROR: Cannot resolve secscope.corp via DNS after 18s."
@@ -114,23 +113,90 @@ try {
 Write-Host "[dc03_join] Creating subdomain $childDomain under $domain..."
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
-Write-Host "[dc03_join] Cleaning up any stale DC03 AD objects..."
-try {
-    $staleComputer = Get-ADComputer -Identity "DC03" -Server $dc01IP -Credential $cred -ErrorAction Stop
-    if ($staleComputer) {
-        Remove-ADObject -Identity $staleComputer.ObjectGUID -Server $dc01IP -Credential $cred -Recursive -Confirm:$false -ErrorAction Stop
-        Write-Host "[dc03_join] Removed stale DC03 AD object and children"
-        Start-Sleep -Seconds 10
+
+# Build the child-domain DN from the parent DN so this stays correct if the
+# domain name ever changes (e.g. DC=it,DC=secscope,DC=corp).
+$parentDN = ($domain.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+$childDN  = "DC=it,$parentDN"
+$partitionsDN = "CN=Partitions,CN=Configuration,$parentDN"
+
+function Remove-StaleChildDomain {
+    param(
+        [string]$ChildDN,
+        [string]$PartitionsDN,
+        [string]$ParentDomain,
+        [string]$ChildDomain,
+        [string]$Server,
+        [pscredential]$Credential
+    )
+
+    # --- stale DC03 computer object in the parent domain ---
+    try {
+        $staleComputer = Get-ADComputer -Identity "DC03" -Server $Server -Credential $Credential -ErrorAction Stop
+        if ($staleComputer) {
+            Remove-ADObject -Identity $staleComputer.ObjectGUID -Server $Server -Credential $Credential -Recursive -Confirm:$false -ErrorAction Stop
+            Write-Host "[dc03_join] Removed stale DC03 AD object and children"
+            Start-Sleep -Seconds 5
+        }
+    } catch {
+        Write-Host "[dc03_join] No stale DC03 computer object to clean"
     }
-} catch {
-    Write-Host "[dc03_join] No stale DC03 to clean (this is fine on first run)"
+
+    # --- stale child-domain crossRef under CN=Partitions ---
+    # nCName is a DN-syntax attribute; a string "-eq" filter does NOT reliably
+    # match (it silently returns nothing), which is why earlier builds logged
+    # "no stale crossRef" while the crossRef was actually present and blocked
+    # promotion with "The specified domain already exists". Enumerate the
+    # Partitions children and match nCName exactly instead.
+    try {
+        $crossRefs = Get-ADObject -SearchBase $PartitionsDN -SearchScope OneLevel `
+            -LDAPFilter "(objectClass=crossRef)" -Properties nCName `
+            -Server $Server -Credential $Credential -ErrorAction Stop |
+            Where-Object { $_.nCName -eq $ChildDN }
+        foreach ($cr in $crossRefs) {
+            Remove-ADObject -Identity $cr.DistinguishedName -Server $Server -Credential $Credential -Recursive -Confirm:$false -ErrorAction Stop
+            Write-Host "[dc03_join] Removed stale child-domain crossRef: $($cr.DistinguishedName)"
+            Start-Sleep -Seconds 5
+        }
+        if (-not $crossRefs) { Write-Host "[dc03_join] No stale crossRef to clean" }
+    } catch {
+        Write-Host "[dc03_join] crossRef cleanup skipped: $_"
+    }
+
+    # --- stale DNS delegation (NS record) + conditional-forwarder zone on DC01 ---
+    # A leftover 'it' NS delegation in the parent zone or an 'it.secscope.corp'
+    # forwarder zone (created by dc01_dns/dc02_postboot) can also confuse the
+    # uniqueness check. Clean them via a remote session to DC01.
+    try {
+        Invoke-Command -ComputerName $Server -Credential $Credential -ScriptBlock {
+            param($Dom, $Child)
+            Import-Module DnsServer -ErrorAction SilentlyContinue
+            # Remove the child NS delegation from the parent zone.
+            Get-DnsServerResourceRecord -ZoneName $Dom -Name "it" -RRType NS -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-DnsServerResourceRecord -ZoneName $Dom -InputObject $_ -Force -ErrorAction SilentlyContinue
+            }
+            # Remove a stale conditional-forwarder zone for the child domain.
+            $fwd = Get-DnsServerZone -Name $Child -ErrorAction SilentlyContinue
+            if ($fwd -and $fwd.ZoneType -eq "Forwarder") {
+                Remove-DnsServerZone -Name $Child -Force -ErrorAction SilentlyContinue
+            }
+        } -ArgumentList $ParentDomain, $ChildDomain -ErrorAction Stop 2>&1 | Out-Null
+    } catch {
+        Write-Host "[dc03_join] Remote DNS delegation/forwarder cleanup skipped: $_"
+    }
 }
+
 Write-Host "[dc03_join] Installing subdomain (retry up to 5 times)..."
 $dsrmSec = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $promoted = $false
 $retryDelays = @(10, 20, 30, 40, 60)
 for ($i = 1; $i -le 5; $i++) {
     Write-Host "[dc03_join] Attempt $i/5..."
+    # Clean any stale child-domain metadata BEFORE every attempt: a half-created
+    # partition from a failed attempt (or a surviving DC01 from a destroyed DC03)
+    # would otherwise wedge all subsequent attempts.
+    Write-Host "[dc03_join] Pre-attempt cleanup of stale child-domain metadata..."
+    Remove-StaleChildDomain -ChildDN $childDN -PartitionsDN $partitionsDN -ParentDomain $domain -ChildDomain $childDomain -Server $dc01IP -Credential $cred
     try {
         Install-ADDSDomain -NewDomainName "it" -ParentDomainName $domain -DomainType ChildDomain -NewDomainNetbiosName "ITSEC" -Credential $cred -SafeModeAdministratorPassword $dsrmSec -Force -NoRebootOnCompletion:$true -ErrorAction Stop
         $promoted = $true

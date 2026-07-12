@@ -10,16 +10,40 @@ Install-WindowsFeature -Name Web-Server, Web-Mgmt-Tools -IncludeManagementTools
 Write-Host "[srv01_services] IIS installed"
 
 Write-Host "[srv01_services] Downloading SQL Server Express..."
+$sqlInstalled = $false
+if (Get-Service "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue) {
+    Write-Host "[srv01_services] SQLEXPRESS instance already present, skipping install"
+    $sqlInstalled = $true
+}
+if (-not $sqlInstalled) {
 try {
-    $sqlUrl  = "https://download.microsoft.com/download/5/1/4/5145fe04-4d30-4b85-b0d1-39533663a2f1/SQL2022-SSEI-Expr.exe"
-    $sqlPath = "C:\Temp\sqlexpress.exe"
+    # SQL2022-SSEI-Expr.exe is only a ~4MB web bootstrapper; /ACTION=Install on it
+    # does NOT reliably create an engine instance. Use it to DOWNLOAD the full
+    # media package, extract the self-extracting SQLEXPR archive, then run its
+    # real setup.exe with the unattended parameters.
+    $sqlUrl   = "https://download.microsoft.com/download/5/1/4/5145fe04-4d30-4b85-b0d1-39533663a2f1/SQL2022-SSEI-Expr.exe"
+    $ssei     = "C:\Temp\SQL2022-SSEI-Expr.exe"
+    $mediaDir = "C:\SQLMedia"
+    $extract  = "C:\SQLExtract"
     New-Item -ItemType Directory -Force -Path C:\Temp | Out-Null
-    Invoke-WebRequest -Uri $sqlUrl -OutFile $sqlPath -TimeoutSec 120 -ErrorAction Stop
-    Write-Host "[srv01_services] SQL downloaded, installing..."
-    Start-Process $sqlPath -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"SECSCOPE\SQLAdmins`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
-    Write-Host "[srv01_services] SQL Server Express installed"
+    Invoke-WebRequest -Uri $sqlUrl -OutFile $ssei -TimeoutSec 300 -ErrorAction Stop
+    Write-Host "[srv01_services] SSEI downloaded, fetching full media (this can take a few minutes)..."
+    Start-Process $ssei -ArgumentList "/ACTION=Download /MEDIAPATH=$mediaDir /MEDIATYPE=Core /QUIET" -Wait
+    $expr = Get-ChildItem $mediaDir -Filter "SQLEXPR*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $expr) { throw "Full media download failed; no SQLEXPR*.exe in $mediaDir" }
+    Write-Host "[srv01_services] Extracting $($expr.Name)..."
+    Start-Process $expr.FullName -ArgumentList "/Q /X:$extract" -Wait
+    Write-Host "[srv01_services] Installing SQL engine from extracted media..."
+    Start-Process "$extract\SETUP.EXE" -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"SECSCOPE\SQLAdmins`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
+    if (Get-Service "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue) {
+        Write-Host "[srv01_services] SQL Server Express installed"
+        $sqlInstalled = $true
+    } else {
+        Write-Host "[srv01_services] WARNING: SQL setup ran but MSSQL`$SQLEXPRESS service not found"
+    }
 } catch {
-    Write-Host "[srv01_services] WARNING: SQL download failed. Install SQL Server Express manually."
+    Write-Host "[srv01_services] WARNING: SQL install failed: $_"
+}
 }
 
 Write-Host "[srv01_services] Starting SQL Express service..."
@@ -81,40 +105,81 @@ try {
     Write-Host "[srv01_services] Installing RSAT-AD-PowerShell..."
     Install-WindowsFeature -Name RSAT-AD-PowerShell -IncludeManagementTools
     Import-Module ActiveDirectory -ErrorAction Stop
-    $configNC = (Get-ADRootDSE).configurationNamingContext
+    # These objects live in the Configuration NC; the provisioner runs as the
+    # local 'vagrant' account which has no AD write rights, so every AD call
+    # must be made with domain credentials against a DC.
+    $adServer = "$domain"
+    $configNC = (Get-ADRootDSE -Server $adServer -Credential $cred).configurationNamingContext
     $templateContainer = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNC"
     $esc1TemplateDN = "CN=ESC1,$templateContainer"
+    # A credentialed AD: drive so Get-Acl/Set-Acl also run as domain admin.
+    Remove-PSDrive -Name ADCred -ErrorAction SilentlyContinue
+    New-PSDrive -Name ADCred -PSProvider ActiveDirectory -Root "//RootDSE/" -Server $adServer -Credential $cred -Scope Global | Out-Null
 
     try {
-        $exists = Get-ADObject -Identity $esc1TemplateDN -ErrorAction Stop
+        $exists = Get-ADObject -Identity $esc1TemplateDN -Server $adServer -Credential $cred -ErrorAction Stop
         Write-Host "[srv01_services] ESC1 template already exists"
     } catch {
-        $otherAttrs = @{
-            "displayName"                      = "ESC1"
-            "msPKI-Cert-Template-OID"          = "1.3.6.1.4.1.311.21.8.9999999.1"
-            "msPKI-Certificate-Name-Flag"      = 1
-            "msPKI-Enrollment-Flag"            = 0
-            "msPKI-RA-Signature"               = 0
-            "msPKI-Minimal-Key-Size"           = 2048
-            "msPKI-Template-Schema-Version"    = 2
-            "msPKI-Template-Minor-Revision"    = 0
-            "msPKI-Certificate-Application-Policy" = @("1.3.6.1.5.5.7.3.2")
-            "pKIExtendedKeyUsage"              = @("1.3.6.1.5.5.7.3.2")
-            "revision"                         = 100
-            "pKIDefaultKeySpec"                = 1
-            "pKIMaxIssuingDepth"               = 0
-            "flags"                            = 131680
+        # Build ESC1 by CLONING the built-in 'User' template (a valid schema-v2
+        # template) rather than hand-crafting attributes. A from-scratch object
+        # is missing binary/flag attributes and a registered OID object, so the
+        # CA silently rejects it (never appears in 'certutil -template'). Cloning
+        # copies every required attribute; we then flip the ESC1 vuln settings.
+        $userDN  = "CN=User,$templateContainer"
+        $userTpl = Get-ADObject -Identity $userDN -Properties * -Server $adServer -Credential $cred
+
+        # Register a unique OID object in the OID container (required for v2).
+        $oidContainer = "CN=OID,CN=Public Key Services,CN=Services,$configNC"
+        $forestOID    = ($userTpl.'msPKI-Cert-Template-OID' -replace '\.\d+\.\d+$','')
+        $suffix       = "{0}.{1}" -f (Get-Random -Minimum 1000000 -Maximum 99999999), (Get-Random -Minimum 10000000 -Maximum 99999999)
+        $esc1OID      = "$forestOID.$suffix"
+        $oidName      = [System.Guid]::NewGuid().ToString().Replace('-','')
+        $oidAttrs = @{
+            "DisplayName"             = "ESC1"
+            "flags"                   = 1
+            "msPKI-Cert-Template-OID" = $esc1OID
         }
+        New-ADObject -Name $oidName -Type "msPKI-Enterprise-Oid" -Path $oidContainer `
+            -OtherAttributes $oidAttrs -Server $adServer -Credential $cred
+        Write-Host "[srv01_services] Registered ESC1 OID object ($esc1OID)"
+
+        # Copy every meaningful attribute from User, then override for ESC1.
+        $copyAttrs = @{}
+        $copyFrom = @(
+            'flags','msPKI-Certificate-Name-Flag','msPKI-Enrollment-Flag',
+            'msPKI-Minimal-Key-Size','msPKI-Private-Key-Flag','msPKI-RA-Signature',
+            'msPKI-Template-Minor-Revision','msPKI-Template-Schema-Version',
+            'pKICriticalExtensions','pKIDefaultCSPs','pKIDefaultKeySpec',
+            'pKIExpirationPeriod','pKIExtendedKeyUsage','pKIKeyUsage',
+            'pKIMaxIssuingDepth','pKIOverlapPeriod','revision'
+        )
+        foreach ($p in $copyFrom) {
+            $val = $userTpl.$p
+            if ($null -ne $val) { $copyAttrs[$p] = $val }
+        }
+        # ESC1 overrides:
+        $copyAttrs["displayName"]                 = "ESC1"
+        $copyAttrs["msPKI-Cert-Template-OID"]     = $esc1OID
+        # ENROLLEE_SUPPLIES_SUBJECT (0x1) — the core ESC1 misconfiguration.
+        $copyAttrs["msPKI-Certificate-Name-Flag"] = 1
+        # No manager approval, no RA signatures, publish to AD.
+        $copyAttrs["msPKI-Enrollment-Flag"]       = 0
+        $copyAttrs["msPKI-RA-Signature"]          = 0
+        # Client Authentication EKU so the cert can be used for auth.
+        $copyAttrs["pKIExtendedKeyUsage"]         = @("1.3.6.1.5.5.7.3.2")
+        $copyAttrs["msPKI-Certificate-Application-Policy"] = @("1.3.6.1.5.5.7.3.2")
+
         New-ADObject -Name "ESC1" `
             -Type "pKICertificateTemplate" `
             -Path $templateContainer `
-            -OtherAttributes $otherAttrs
-        Write-Host "[srv01_services] ESC1 template object created"
+            -OtherAttributes $copyAttrs `
+            -Server $adServer -Credential $cred
+        Write-Host "[srv01_services] ESC1 template object created (cloned from User)"
 
         Start-Sleep 5
 
-        $domainUsersSID = (Get-ADGroup "Domain Users").SID
-        $acl = Get-Acl "AD:\$esc1TemplateDN"
+        $domainUsersSID = (Get-ADGroup "Domain Users" -Server $adServer -Credential $cred).SID
+        $acl = Get-Acl "ADCred:\$esc1TemplateDN"
         $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
             $domainUsersSID,
             [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
@@ -123,15 +188,28 @@ try {
             [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
         )
         $acl.AddAccessRule($rule)
-        Set-Acl "AD:\$esc1TemplateDN" $acl
+        Set-Acl "ADCred:\$esc1TemplateDN" $acl
         Write-Host "[srv01_services] Domain Users granted Enroll on ESC1 template"
 
+        # Give AD a moment to replicate the new template to the CA's DC before
+        # publishing. The publish loop below also pulses/retries.
+        Start-Sleep 15
+
         Write-Host "[srv01_services] Publishing ESC1 template to CA..."
-        try {
+        $published = $false
+        for ($p = 1; $p -le 6; $p++) {
+            certutil -pulse 2>&1 | Out-Null
             certutil -setCAtemplates +"ESC1" 2>&1 | Out-Null
-            Write-Host "[srv01_services] ESC1 template published to CA"
-        } catch {
-            Write-Host "[srv01_services] CA template binding may need manual step: $_"
+            if ((certutil -CATemplates 2>&1 | Select-String -Quiet "ESC1")) {
+                $published = $true
+                Write-Host "[srv01_services] ESC1 template published to CA (attempt $p)"
+                break
+            }
+            Write-Host "[srv01_services] Publish attempt $p/6, waiting for replication..."
+            Start-Sleep 15
+        }
+        if (-not $published) {
+            Write-Host "[srv01_services] WARNING: ESC1 created but CA publish not confirmed; run 'certutil -setCAtemplates +ESC1' after replication."
         }
     }
     Write-Host "[srv01_services] ESC1 template configured (ENROLLEE_SUPPLIES_SUBJECT, Client Auth EKU, Domain Users enroll)"

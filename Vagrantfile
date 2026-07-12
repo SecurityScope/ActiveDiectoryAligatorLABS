@@ -92,7 +92,8 @@ def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: SERVER_BOX
       v.customize ["modifyvm", :id, "--boot2", "none"]
     end
 
-    vm.vm.provision "common", type: "shell", path: "scripts/common_windows.ps1"
+    vm.vm.provision "common", type: "shell", path: "scripts/common_windows.ps1",
+      env: { "SKIP_NLA_FIX" => ENV['SKIP_NLA_FIX'] }
 
     vm.vm.provision "harden", type: "shell", run: "never",
       path: "scripts/harden_windows.ps1"
@@ -186,6 +187,11 @@ Vagrant.configure("2") do |config|
         "ADMIN_PASS"   => ADMIN_PASS,
         "DSRM_PASS"    => DSRM_PASS
       }
+
+    vm.vm.provision "avupdate-gpo", type: "shell", run: "never",
+      path: "scripts/dc01_av_update_gpo.ps1", env: {
+        "DOMAIN" => DOMAIN
+      }
   end
 
   # ─── DC02 ─── Secondary Domain Controller ─────────────────────────────────
@@ -264,7 +270,7 @@ Vagrant.configure("2") do |config|
     vm.vm.provision "sysprep", type: "shell", run: "never",
       path: "scripts/sysprep_sid.ps1"
 
-    vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
+    vm.vm.provision "join", type: "shell", run: "never", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,
       "ADMIN_PASS"   => ADMIN_PASS,
@@ -274,7 +280,7 @@ Vagrant.configure("2") do |config|
       "LOG_PREFIX"   => "srv01_join"
     }
 
-    vm.vm.provision "join-reload", type: :reload
+    vm.vm.provision "join-reload", type: :reload, run: "never"
 
     vm.vm.provision "services", type: "shell", run: "never",
       path: "scripts/srv01_services.ps1", env: {
@@ -289,7 +295,7 @@ Vagrant.configure("2") do |config|
     vm.vm.provision "sysprep", type: "shell", run: "never",
       path: "scripts/sysprep_sid.ps1"
 
-    vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
+    vm.vm.provision "join", type: "shell", run: "never", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,
       "ADMIN_PASS"   => ADMIN_PASS,
@@ -299,7 +305,7 @@ Vagrant.configure("2") do |config|
       "LOG_PREFIX"   => "ws01_join"
     }
 
-    vm.vm.provision "join-reload", type: :reload
+    vm.vm.provision "join-reload", type: :reload, run: "never"
 
     vm.vm.provision "misconfig", type: "shell", run: "never",
       path: "scripts/ws01_misconfig.ps1", env: {
@@ -313,7 +319,7 @@ Vagrant.configure("2") do |config|
     vm.vm.provision "sysprep", type: "shell", run: "never",
       path: "scripts/sysprep_sid.ps1"
 
-    vm.vm.provision "join", type: "shell", path: "scripts/domain_join.ps1", env: {
+    vm.vm.provision "join", type: "shell", run: "never", path: "scripts/domain_join.ps1", env: {
       "DOMAIN"       => DOMAIN,
       "DOMAIN_UPPER" => DOMAIN_UPPER,
       "ADMIN_PASS"   => ADMIN_PASS,
@@ -323,7 +329,7 @@ Vagrant.configure("2") do |config|
       "LOG_PREFIX"   => "ws02_join"
     }
 
-    vm.vm.provision "join-reload", type: :reload
+    vm.vm.provision "join-reload", type: :reload, run: "never"
 
     vm.vm.provision "misconfig", type: "shell", run: "never",
       path: "scripts/ws02_misconfig.ps1"
@@ -332,7 +338,11 @@ Vagrant.configure("2") do |config|
   # ─── LIN01 ─── Debian Linux Domain Member ─────────────────────────────────
 
   config.vm.define "lin01" do |vm|
-    vm.vm.box = "debian/bookworm64"
+    vm.vm.box = "secscope/debian-bookworm"
+    vm.ssh.username = "vagrant"
+    vm.ssh.password = "vagrant"
+
+    vm.vm.network "forwarded_port", guest: 22, host: 22240, auto_correct: true
 
     vm.vm.provider "virtualbox" do |v|
       v.gui = false
@@ -341,6 +351,8 @@ Vagrant.configure("2") do |config|
       v.customize ["modifyvm", :id, "--name", "LIN01.SECSCOPE.CORP"]
       v.customize ["modifyvm", :id, "--nic2", "natnetwork"]
       v.customize ["modifyvm", :id, "--nat-network2", "SECSCOPE.CORP"]
+      v.customize ["modifyvm", :id, "--boot1", "disk"]
+      v.customize ["modifyvm", :id, "--boot2", "none"]
     end
 
     vm.vm.provision "setup", type: "shell", path: "scripts/lin01_setup.sh", env: {
@@ -349,8 +361,23 @@ Vagrant.configure("2") do |config|
       "ADMIN_PASS" => ADMIN_PASS
     }
 
-    vm.vm.provision "harden", type: "shell", run: "never",
-      inline: "usermod -L vagrant"
+    # Fully remove the vagrant account. Set a root password FIRST (to ADMIN_PASS)
+    # so console/root login survives - otherwise deleting vagrant (the only
+    # sudoer) locks you out. Then kill vagrant's live processes and userdel -r.
+    vm.vm.provision "harden", type: "shell", run: "never", env: { "ADMIN_PASS" => ADMIN_PASS },
+      inline: <<-SHELL
+        set -e
+        echo "root:${ADMIN_PASS}" | chpasswd
+        echo "[harden] root password set (console login preserved)"
+        pkill -KILL -u vagrant 2>/dev/null || true
+        sleep 1
+        userdel -r -f vagrant 2>/dev/null || true
+        if id vagrant >/dev/null 2>&1; then
+          echo "[harden] WARNING: vagrant user still present"
+        else
+          echo "[harden] vagrant user deleted (home removed)"
+        fi
+      SHELL
   end
 
 end

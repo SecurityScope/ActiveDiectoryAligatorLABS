@@ -2,6 +2,16 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "[dc01_dns] Starting DNS and services setup..."
 
+function Wait-ServiceRunning {
+    param([string]$Name, [int]$TimeoutSec = 30)
+    for ($s = 0; $s -lt $TimeoutSec; $s += 2) {
+        $svc = Get-Service $Name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { return $true }
+        Start-Sleep 2
+    }
+    return $false
+}
+
 $domain      = $env:DOMAIN
 $childDomain = $env:CHILD_DOMAIN
 $adminPass   = $env:ADMIN_PASS
@@ -36,25 +46,40 @@ Write-Host "[dc01_dns] Fixing DNS client before SRV registration..."
 $adapters = Get-NetAdapter | Where-Object Status -eq "Up"
 foreach ($a in $adapters) {
     Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses "127.0.0.1"
-    Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
+    # The internal (natnetwork, 192.168.x) adapter MUST have connection
+    # registration enabled, otherwise Netlogon reports "No DNS servers
+    # configured for local system" and silently fails to register the
+    # DC-locator SRV records. Only disable registration on the NAT adapter
+    # (10.0.2.x) so its WAN IP never pollutes the AD DNS zones.
+    $ip = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    if ($ip -like "192.168.*") {
+        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $true
+        Write-Host "[dc01_dns] Registration ENABLED on internal adapter ($ip)"
+    } else {
+        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
+        Write-Host "[dc01_dns] Registration disabled on non-internal adapter ($ip)"
+    }
 }
 Clear-DnsClientCache
-Write-Host "[dc01_dns] DNS client -> 127.0.0.1 on all adapters"
+Write-Host "[dc01_dns] DNS client -> 127.0.0.1 on all adapters (internal adapter registers)"
 
 Write-Host "[dc01_dns] Waiting for AD to signal DNS sync completion..."
+# On a forest-root DC with no replication partners the DsAvailable signal is
+# often never raised (AD is already confirmed ready above), so cap this at a
+# short poll then force-set rather than burning the old 240s every build.
 $dsReady = $false
-for ($i = 1; $i -le 24; $i++) {
+for ($i = 1; $i -le 6; $i++) {
     $dsAvail = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNS Server" -Name "DsAvailable" -ErrorAction SilentlyContinue).DsAvailable
     if ($dsAvail -eq 1) {
-        Write-Host "[dc01_dns] AD signaled sync complete after $((i-1)*10)s"
+        Write-Host "[dc01_dns] AD signaled sync complete after $((i-1)*5)s"
         $dsReady = $true
         break
     }
-    Write-Host "[dc01_dns] DsAvailable=$dsAvail, waiting (attempt $i/24)..."
-    Start-Sleep 10
+    Write-Host "[dc01_dns] DsAvailable=$dsAvail, waiting (attempt $i/6)..."
+    Start-Sleep 5
 }
 if (-not $dsReady) {
-    Write-Host "[dc01_dns] WARNING: DsAvailable not set after 240s, forcing..."
+    Write-Host "[dc01_dns] DsAvailable not signaled after 30s, forcing (expected on forest root)..."
     Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNS Server" -Name "DsAvailable" -Value 1 -Type DWord -Force
 }
 
@@ -68,8 +93,8 @@ Write-Host "[dc01_dns] Deleted stale zone files"
 
 Write-Host "[dc01_dns] Restarting DNS Server..."
 Restart-Service DNS -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 15
-Write-Host "[dc01_dns] DNS Server restarted"
+if (Wait-ServiceRunning -Name DNS -TimeoutSec 30) { Write-Host "[dc01_dns] DNS Server running" }
+else { Write-Host "[dc01_dns] WARNING: DNS Server not running after 30s" }
 
 Write-Host "[dc01_dns] Ensuring zones are AD-integrated..."
 $zone = Get-DnsServerZone -Name $domain -ErrorAction SilentlyContinue
@@ -85,34 +110,35 @@ if (-not ($mszone -and $mszone.IsDsIntegrated)) {
 
 Write-Host "[dc01_dns] Restarting Netlogon to register SRV records..."
 Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 20
+Wait-ServiceRunning -Name Netlogon -TimeoutSec 30 | Out-Null
 $nlStatus = (Get-Service Netlogon -ErrorAction SilentlyContinue).Status
 Write-Host "[dc01_dns] Netlogon status: $nlStatus"
 
 Write-Host "[dc01_dns] Verifying critical SRV records exist..."
 $srvVerified = $false
-for ($i = 1; $i -le 8; $i++) {
+for ($i = 1; $i -le 10; $i++) {
     $result = nslookup -type=srv _ldap._tcp.$domain 127.0.0.1 2>&1
     if ($result -match "svr hostname") {
         Write-Host "[dc01_dns] _ldap SRV record found via nslookup"
         $srvVerified = $true
         break
     }
-    Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/8)..."
-    Start-Sleep 15
-    if ($i -eq 4) {
+    Write-Host "[dc01_dns] Waiting for SRV records (attempt $i/10)..."
+    Start-Sleep 6
+    if ($i -eq 2) {
         Write-Host "[dc01_dns] Forcing Netlogon DNS registration..."
         nltest /dsregdns 2>&1 | Out-Null
-        Start-Sleep 10
     }
 }
 if (-not $srvVerified) {
-    Write-Host "[dc01_dns] ERROR: SRV records still missing after 120s!"
+    Write-Host "[dc01_dns] ERROR: SRV records still missing after 60s!"
     Write-Host "[dc01_dns] Last attempt: restarting DNS + Netlogon one more time..."
     Restart-Service DNS -Force -ErrorAction SilentlyContinue
-    Start-Sleep 10
+    Wait-ServiceRunning -Name DNS -TimeoutSec 20 | Out-Null
     Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
-    Start-Sleep 30
+    Wait-ServiceRunning -Name Netlogon -TimeoutSec 20 | Out-Null
+    nltest /dsregdns 2>&1 | Out-Null
+    Start-Sleep 10
     $result = nslookup -type=srv _ldap._tcp.$domain 127.0.0.1 2>&1
     if ($result -notmatch "svr hostname") {
         Write-Host "[dc01_dns] FATAL: SRV records could not be created. Aborting."
@@ -122,9 +148,21 @@ if (-not $srvVerified) {
 }
 Write-Host "[dc01_dns] SRV records verified successfully"
 
-Write-Host "[dc01_dns] Restarting NLA (network profile re-detection)..."
-Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
+Write-Host "[dc01_dns] Forcing NLA re-detection (Private -> DomainAuthenticated)..."
+# NLA classifies the network at boot before DNS/AD is reachable and caches
+# "Private", never re-checking on its own. Set-NetConnectionProfile cannot set
+# DomainAuthenticated (that category is auto-assigned by NLA only). Bouncing
+# the internal adapter forces a fresh NLA discovery now that AD/DNS are up.
+# WinRM runs over the NAT adapter, so this does not drop the session.
+$internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {
+    (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*"
+} | Select-Object -First 1
+if ($internal) {
+    Restart-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep 8
+    $cat = (Get-NetConnectionProfile -InterfaceAlias $internal.Name -ErrorAction SilentlyContinue).NetworkCategory
+    Write-Host "[dc01_dns] Network category on $($internal.Name): $cat"
+}
 
 Write-Host "[dc01_dns] Setting Domain Administrator password..."
 try {
@@ -204,7 +242,7 @@ try {
     Write-Host "[dc01_dns] Domain functional level check/set: $_"
 }
 
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "ConfigurationStatus" -Value 0 -ErrorAction SilentlyContinue
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "ConfigurationStatus" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
 
 Write-Host "[dc01_dns] Installing LAPS (offline-first fallback)..."
 $lapsLocal = "C:\vagrant\LAPS.x64.msi"
@@ -218,7 +256,7 @@ if (Test-Path $lapsLocal) {
 } else {
     try {
         $lapsUrl = "https://download.microsoft.com/download/C/7/A/C7AAD914-A8A6-4904-88A1-29E657445D03/LAPS.x64.msi"
-        Invoke-WebRequest -Uri $lapsUrl -OutFile $lapsTemp -TimeoutSec 120 -ErrorAction Stop
+        Invoke-WebRequest -Uri $lapsUrl -OutFile $lapsTemp -TimeoutSec 30 -ErrorAction Stop
         Start-Process msiexec.exe -ArgumentList "/i `"$lapsTemp`" /quiet /norestart" -Wait
         Write-Host "[dc01_dns] LAPS installed from internet"
     } catch {
@@ -226,9 +264,17 @@ if (Test-Path $lapsLocal) {
     }
 }
 
-Write-Host "[dc01_dns] Cleaning stale NAT IPs from DNS zones..."
-Get-DnsServerZone | Where-Object ZoneType -eq "Primary" | ForEach-Object {
-    $zoneName = $_.ZoneName
+Write-Host "[dc01_dns] Cleaning stale NAT / IPv6 leaks from DNS zones..."
+# Durable, idempotent NAT-leak cleanup. 10.0.2.15 is every VM's own NAT IP, so a
+# leaked "<host> -> 10.0.2.x" A record (or a link-local/ULA AAAA record) makes
+# clients round-robin onto themselves and breaks Kerberos/replication/joins.
+# Runs on every DNS provision so the leak (which DCs can transiently re-register
+# under DHCP timing) never survives into a member join. Only touches NAT-range A
+# records and AAAA records in the forward zones — never 192.168.200.x records,
+# machine accounts, or services.
+$leakZones = Get-DnsServerZone | Where-Object { $_.ZoneType -eq "Primary" -and -not $_.IsReverseLookupZone -and $_.ZoneName -notlike "*arpa*" }
+foreach ($z in $leakZones) {
+    $zoneName = $z.ZoneName
     Get-DnsServerResourceRecord -ZoneName $zoneName -RRType A -ErrorAction SilentlyContinue | ForEach-Object {
         $ip = $_.RecordData.IPv4Address.IPAddressToString
         if ($ip -like "10.0.2.*") {
@@ -236,8 +282,20 @@ Get-DnsServerZone | Where-Object ZoneType -eq "Primary" | ForEach-Object {
             Remove-DnsServerResourceRecord -ZoneName $zoneName -RRType A -Name $_.HostName -RecordData $ip -Force -ErrorAction SilentlyContinue
         }
     }
+    # AD DNS should be IPv4-only in this lab; any AAAA is a NAT/VirtualBox IPv6
+    # leak (e.g. the dc02 AAAA seen in the DC03 session). Strip them all.
+    Get-DnsServerResourceRecord -ZoneName $zoneName -RRType AAAA -ErrorAction SilentlyContinue | ForEach-Object {
+        $ip6 = $_.RecordData.IPv6Address.IPAddressToString
+        Write-Host "[dc01_dns] Removing AAAA leak: $($_.HostName) -> $ip6 from $zoneName"
+        Remove-DnsServerResourceRecord -ZoneName $zoneName -RRType AAAA -Name $_.HostName -RecordData $ip6 -Force -ErrorAction SilentlyContinue
+    }
 }
+Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+Clear-DnsClientCache -ErrorAction SilentlyContinue
 Write-Host "[dc01_dns] Disabling IPv6 DNS server registration..."
-Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
+Import-Module DnsServer -ErrorAction SilentlyContinue
+if (Get-Command Set-DnsServerGlobalSetting -ErrorAction SilentlyContinue) {
+    Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
+}
 
 Write-Host "[dc01_dns] Done"
