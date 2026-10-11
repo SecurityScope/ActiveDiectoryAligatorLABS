@@ -6,6 +6,39 @@ $domain      = $env:DOMAIN
 $childDomain = $env:CHILD_DOMAIN
 $adminPass   = $env:ADMIN_PASS
 $dc01IP      = $env:DC01_IP
+$dcIP        = $env:DC_IP
+
+# Re-assert the internal static IP before contacting DC01. After sysprep + the
+# rename-commit reload the internal natnetwork adapter can revert to DHCP and
+# fall back to APIPA 169.254.x (no DHCP on the LAN), so dc_base.ps1's static IP
+# doesn't always survive. Identify the internal adapter as the Up one NOT on the
+# 10.0.2.x NAT, re-enable it if sysprep left it errored, and pin $dcIP.
+if ($dcIP) {
+    Write-Host "[dc03_join] Ensuring internal static IP $dcIP..."
+    $errored = Get-PnpDevice -Class Net -Status Error -ErrorAction SilentlyContinue
+    foreach ($d in $errored) { Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue }
+    if ($errored) { Start-Sleep 5 }
+    $intf = $null
+    foreach ($a in (Get-NetAdapter | Where-Object Status -eq 'Up')) {
+        $aip = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+        if ($aip -notlike '10.0.2.*') { $intf = $a; break }
+    }
+    if ($intf) {
+        $curr = (Get-NetIPAddress -InterfaceIndex $intf.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+        if ($curr -ne $dcIP) {
+            Write-Host "[dc03_join] Internal adapter '$($intf.Name)' is '$curr'; setting static $dcIP"
+            Get-NetIPAddress -InterfaceIndex $intf.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+            netsh interface ip set address name="$($intf.Name)" static $dcIP 255.255.255.0 192.168.200.1 | Out-Null
+            Set-NetIPInterface -InterfaceIndex $intf.InterfaceIndex -Dhcp Disabled -ErrorAction SilentlyContinue
+            Set-DnsClientServerAddress -InterfaceIndex $intf.InterfaceIndex -ServerAddresses $dc01IP -ErrorAction SilentlyContinue
+            Start-Sleep 3
+        } else {
+            Write-Host "[dc03_join] Internal adapter already on $dcIP"
+        }
+    } else {
+        Write-Host "[dc03_join] WARNING: could not identify internal (non-NAT) adapter"
+    }
+}
 
 Write-Host "[dc03_join] Waiting for DC01 to be reachable..."
 $reachable = $false

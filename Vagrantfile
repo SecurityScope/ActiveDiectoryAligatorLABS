@@ -249,7 +249,8 @@ Vagrant.configure("2") do |config|
         "DOMAIN"       => DOMAIN,
         "DOMAIN_UPPER" => DOMAIN_UPPER,
         "ADMIN_PASS"   => ADMIN_PASS,
-        "DC01_IP"      => DC01_IP
+        "DC01_IP"      => DC01_IP,
+        "DC_IP"        => DC02_IP
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
@@ -285,7 +286,8 @@ Vagrant.configure("2") do |config|
         "DOMAIN_UPPER" => DOMAIN_UPPER,
         "CHILD_DOMAIN" => CHILD_DOMAIN,
         "ADMIN_PASS"   => ADMIN_PASS,
-        "DC01_IP"      => DC01_IP
+        "DC01_IP"      => DC01_IP,
+        "DC_IP"        => DC03_IP
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
