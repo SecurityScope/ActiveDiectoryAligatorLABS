@@ -609,22 +609,33 @@ def sysprep_vm(vm):
         return
     log_info(f"Sysprep (new SID) on {vm}...")
     provision(vm, "sysprep")
-    # /generalize reboots into OOBE and drops WinRM. Wait for it to go down...
-    for _ in range(18):
-        rc, _ = vagrant(["winrm", vm, "-c", "exit 0"], capture=True, timeout=30)
-        if rc != 0:
-            break
-        time.sleep(5)
-    # ...then wait for it to come back.
+    # sysprep /generalize /oobe /reboot runs ASYNCHRONOUSLY and reboots the VM on
+    # its own schedule, OUTSIDE Vagrant's control. The generalize + specialize +
+    # OOBE cycle never completes in under ~90s. The old "poll WinRM until it
+    # drops, then until it returns" logic raced that cycle: a transient WinRM blip
+    # during generalize was misread as "sysprep finished", so the next reload
+    # fired WHILE generalize was still running - interrupting it and corrupting
+    # the image (every subsequent boot then times out). Instead: give sysprep a
+    # mandatory settle window, THEN wait for the post-OOBE FirstLogonCommands to
+    # bring WinRM back, requiring two consecutive successes so we never latch onto
+    # a half-up pre-reboot session.
+    SETTLE = 90
+    log_info(f"Waiting {SETTLE}s for {vm} to generalize + reboot into OOBE...")
+    time.sleep(SETTLE)
     online = False
-    for i in range(1, 31):
-        time.sleep(10)
+    streak = 0
+    for i in range(1, 41):  # ~ up to SETTLE + several minutes
         rc, _ = vagrant(["winrm", vm, "-c", "exit 0"], capture=True, timeout=30)
         if rc == 0:
-            log_ok(f"{vm} back online after sysprep ({i*10}s)")
-            online = True
-            break
-        log_verbose(f"    {vm} sysprep wait {i}/30...")
+            streak += 1
+            if streak >= 2:
+                log_ok(f"{vm} back online after sysprep (~{SETTLE + i*10}s)")
+                online = True
+                break
+        else:
+            streak = 0
+        time.sleep(10)
+        log_verbose(f"    {vm} post-sysprep wait {i}/40 (streak={streak})...")
     if not online:
         raise LabError(f"{vm} did not come back after sysprep")
     log_info(f"Reloading {vm} to stabilize...")
