@@ -39,15 +39,40 @@ foreach ($a in $adapters) {
 }
 Clear-DnsClientCache
 
-Write-Host "[dc03_postboot] Forcing NLA re-detection (Private -> DomainAuthenticated)..."
+Write-Host "[dc03_postboot] Forcing NLA re-detection (-> DomainAuthenticated)..."
+# CRITICAL for the child DC: if the internal NIC stays 'Public', the DC Locator
+# (DsGetDcName) fails with 1908 "could not find the domain controller for this
+# domain" and inbound Config/Schema replication from DC01 breaks. A plain
+# Restart-NetAdapter does NOT reliably flip it to DomainAuthenticated here - a
+# full Disable/Enable of the adapter plus an NlaSvc restart does. Loop until the
+# category is DomainAuthenticated (or give up after a few tries).
 $internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {
     (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*"
 } | Select-Object -First 1
 if ($internal) {
-    Restart-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
-    Start-Sleep 8
+    for ($n = 1; $n -le 4; $n++) {
+        $cat = (Get-NetConnectionProfile -InterfaceAlias $internal.Name -ErrorAction SilentlyContinue).NetworkCategory
+        if ($cat -eq "DomainAuthenticated") { break }
+        Write-Host "[dc03_postboot] Category '$cat' (attempt $n/4); cycling adapter + NlaSvc..."
+        nltest /dsregdns 2>&1 | Out-Null
+        Restart-Service Netlogon -Force -ErrorAction SilentlyContinue
+        Disable-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep 3
+        Enable-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep 8
+        Restart-Service NlaSvc -Force -ErrorAction SilentlyContinue
+        Start-Sleep 10
+    }
     $cat = (Get-NetConnectionProfile -InterfaceAlias $internal.Name -ErrorAction SilentlyContinue).NetworkCategory
     Write-Host "[dc03_postboot] Network category on $($internal.Name): $cat"
+    if ($cat -eq "DomainAuthenticated") {
+        # Now that the locator works, kick the KCC + force the inbound links so we
+        # don't wait on the default schedule to clear the earlier 1908 failures.
+        repadmin /kcc 2>&1 | Out-Null
+        repadmin /replicate dc03 dc01 "CN=Configuration,DC=$($env:DOMAIN.Split('.') -join ',DC=')" 2>&1 | Out-Null
+        repadmin /replicate dc03 dc01 "CN=Schema,CN=Configuration,DC=$($env:DOMAIN.Split('.') -join ',DC=')" 2>&1 | Out-Null
+        Write-Host "[dc03_postboot] Forced Config/Schema replication from DC01"
+    }
 }
 
 Write-Host "[dc03_postboot] Setting Administrator password..."
@@ -137,7 +162,9 @@ Get-NetAdapter | ForEach-Object {
         Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
     }
 }
-Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
+if (Get-Command Set-DnsServerGlobalSetting -ErrorAction SilentlyContinue) {
+    Set-DnsServerGlobalSetting -EnableIPv6 $false -ErrorAction SilentlyContinue
+}
 
 Write-Host "[dc03_postboot] Registering DNS records..."
 ipconfig /registerdns 2>&1 | Out-Null

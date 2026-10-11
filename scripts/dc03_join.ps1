@@ -110,13 +110,19 @@ try {
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $secPass)
 try {
+    # Generic catch (not a typed catch on the AD-module exception): the
+    # ActiveDirectory type isn't loaded this early, so a typed catch throws
+    # "Unable to find type [...ADIdentityNotFoundException]". Match on the
+    # message instead to distinguish "not found" (proceed) from other errors.
     $null = Get-ADDomain -Identity $childDomain -Server $dc01IP -Credential $cred -ErrorAction Stop
     Write-Host "[dc03_join] Subdomain $childDomain already exists in forest, skipping promotion"
     exit 0
-} catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-    Write-Host "[dc03_join] Child domain does not exist yet, proceeding with promotion"
 } catch {
-    Write-Host "[dc03_join] Child-domain existence check inconclusive ($_), proceeding with promotion"
+    if ($_.Exception.Message -match "Cannot find an object|does not exist|not found") {
+        Write-Host "[dc03_join] Child domain does not exist yet, proceeding with promotion"
+    } else {
+        Write-Host "[dc03_join] Child-domain existence check inconclusive ($_), proceeding with promotion"
+    }
 }
 
 Write-Host "[dc03_join] Installing AD-Domain-Services and DNS..."
