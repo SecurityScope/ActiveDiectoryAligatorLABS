@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+import select
 import argparse
 import shutil
 import subprocess
@@ -262,12 +263,42 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
     except FileNotFoundError:
         raise LabError(f"Executable not found: {cmd[0]}")
     assert proc.stdout is not None
-    for line in proc.stdout:
+
+    def _emit(line):
         line = line.rstrip("\n")
         if filter_winrm and not show_all and WINRM_NOISE.search(line):
-            continue
+            return
         if not QUIET:
             print(line, flush=True)
+
+    if os.name == "posix":
+        # Drain with process-exit awareness. Tools like packer spawn VirtualBox,
+        # which starts the long-lived VBoxSVC daemon; VBoxSVC can INHERIT this
+        # stdout pipe, so a plain `for line in proc.stdout` never sees EOF after
+        # packer exits and the build hangs forever between "box built" and the
+        # next step. Here, once the process has exited and the pipe is idle, we
+        # stop even if a grandchild still holds the write end open.
+        fd = proc.stdout.fileno()
+        while True:
+            rlist, _, _ = select.select([fd], [], [], 0.5)
+            if rlist:
+                line = proc.stdout.readline()
+                if line:
+                    _emit(line)
+                    continue
+                break  # empty read on a readable fd == genuine EOF
+            if proc.poll() is not None:
+                # Exited with nothing pending this tick; one short grace drain.
+                rlist, _, _ = select.select([fd], [], [], 0.2)
+                if not rlist:
+                    break
+    else:
+        for line in proc.stdout:
+            _emit(line)
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
     proc.wait(timeout=timeout)
     if check and proc.returncode != 0:
         raise LabError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
