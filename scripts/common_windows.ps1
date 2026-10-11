@@ -6,6 +6,19 @@ Write-Host "[common] Setting PowerShell execution policy..."
 Set-ExecutionPolicy Unrestricted -Scope Process -Force *>$null
 Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force *>$null
 
+Write-Host "[common] Disabling Windows Automatic Repair / WinRE on boot failure..."
+# This build reboots a VM many times (sysprep, base, promotion, join). Whenever
+# `vagrant reload` has to hard power-off a guest that is still busy, Windows
+# otherwise boots into the Automatic Repair / Recovery environment ("It looks
+# like Windows didn't load correctly") and waits for someone to click "Restart
+# my PC" - which never happens headless, so the next boot times out and the
+# build fails. Tell the boot manager to ignore boot failures and never auto-
+# launch WinRE, so every reboot goes straight back into Windows.
+bcdedit /set "{default}" bootstatuspolicy ignoreallfailures *>$null
+bcdedit /set "{default}" recoveryenabled No *>$null
+bcdedit /set "{current}" bootstatuspolicy ignoreallfailures *>$null
+bcdedit /set "{current}" recoveryenabled No *>$null
+
 Write-Host "[common] Disabling Windows Firewall..."
 Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
 

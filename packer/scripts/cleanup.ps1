@@ -1,6 +1,16 @@
 $ErrorActionPreference = "Continue"
 Write-Host "[cleanup] Starting disk cleanup..."
 
+# Bake "never boot into Automatic Repair / WinRE" into the box so an unclean
+# shutdown (common with the many `vagrant reload` reboots during lab provisioning)
+# reboots straight back into Windows instead of hanging at the blue Recovery
+# screen waiting for a "Restart my PC" click that never comes headless.
+Write-Host "[cleanup] Disabling Automatic Repair / WinRE on boot failure..."
+bcdedit /set "{default}" bootstatuspolicy ignoreallfailures *>$null
+bcdedit /set "{default}" recoveryenabled No *>$null
+bcdedit /set "{current}" bootstatuspolicy ignoreallfailures *>$null
+bcdedit /set "{current}" recoveryenabled No *>$null
+
 # Clean Windows Update cache
 Remove-Item -Recurse -Force "C:\Windows\SoftwareDistribution\Download\*" `
     -ErrorAction SilentlyContinue
