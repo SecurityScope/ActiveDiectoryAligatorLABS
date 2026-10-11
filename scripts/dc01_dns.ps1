@@ -236,22 +236,35 @@ try {
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\10" -Name "ConfigurationStatus" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
 
 Write-Host "[dc01_dns] Installing LAPS (offline-first fallback)..."
+# ADDLOCAL=ALL installs the management tools too (AdmPwd.PS module + ADMX), not
+# just the client CSE. Without the PS module, dc01_objects.ps1 cannot extend the
+# schema / set LAPS permissions / build the LAPS GPO (it logs "AdmPwd.PS module
+# not available" and skips the whole LAPS exercise).
 $lapsLocal = "C:\vagrant\LAPS.x64.msi"
 $lapsTemp  = "C:\Windows\Temp\LAPS.x64.msi"
+$lapsMsi   = $null
 if (Test-Path $lapsLocal) {
-    Start-Process msiexec.exe -ArgumentList "/i `"$lapsLocal`" /quiet /norestart" -Wait
-    Write-Host "[dc01_dns] LAPS installed from local file"
+    $lapsMsi = $lapsLocal
+    Write-Host "[dc01_dns] LAPS MSI: local file"
 } elseif (Test-Path $lapsTemp) {
-    Start-Process msiexec.exe -ArgumentList "/i `"$lapsTemp`" /quiet /norestart" -Wait
-    Write-Host "[dc01_dns] LAPS installed from cached file"
+    $lapsMsi = $lapsTemp
+    Write-Host "[dc01_dns] LAPS MSI: cached file"
 } else {
     try {
         $lapsUrl = "https://download.microsoft.com/download/C/7/A/C7AAD914-A8A6-4904-88A1-29E657445D03/LAPS.x64.msi"
-        Invoke-WebRequest -Uri $lapsUrl -OutFile $lapsTemp -TimeoutSec 30 -ErrorAction Stop
-        Start-Process msiexec.exe -ArgumentList "/i `"$lapsTemp`" /quiet /norestart" -Wait
-        Write-Host "[dc01_dns] LAPS installed from internet"
+        Invoke-WebRequest -Uri $lapsUrl -OutFile $lapsTemp -TimeoutSec 60 -ErrorAction Stop
+        $lapsMsi = $lapsTemp
+        Write-Host "[dc01_dns] LAPS MSI: downloaded from internet"
     } catch {
-        Write-Host "[dc01_dns] WARNING: LAPS unavailable"
+        Write-Host "[dc01_dns] WARNING: LAPS unavailable (offline + download failed)"
+    }
+}
+if ($lapsMsi) {
+    Start-Process msiexec.exe -ArgumentList "/i `"$lapsMsi`" /quiet /norestart ADDLOCAL=ALL" -Wait
+    if (Get-Module -ListAvailable AdmPwd.PS -ErrorAction SilentlyContinue) {
+        Write-Host "[dc01_dns] LAPS installed (AdmPwd.PS module present)"
+    } else {
+        Write-Host "[dc01_dns] WARNING: LAPS installed but AdmPwd.PS module not found"
     }
 }
 

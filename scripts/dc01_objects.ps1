@@ -44,15 +44,17 @@ Write-Host "[objects] Domain DN: $domainDN"
 # own Administrator) so every "OU=IT,$domainDN" reference below resolves. This
 # makes a re-run of this script (e.g. the per-member ACL pass) build-order
 # independent instead of silently recreating an empty OU=IT alongside IT_TEMP.
-try {
-    $itTemp = Get-ADOrganizationalUnit -Identity "OU=IT_TEMP,$domainDN" -ErrorAction SilentlyContinue
-    $itReal = Get-ADOrganizationalUnit -Identity "OU=IT,$domainDN" -ErrorAction SilentlyContinue
-    if ($itTemp -and -not $itReal) {
+# -Filter (not -Identity) so a missing OU returns $null quietly instead of
+# throwing "Directory object not found" on a clean build where neither exists.
+$itTemp = Get-ADOrganizationalUnit -Filter "Name -eq 'IT_TEMP'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
+$itReal = Get-ADOrganizationalUnit -Filter "Name -eq 'IT'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
+if ($itTemp -and -not $itReal) {
+    try {
         Rename-ADObject -Identity $itTemp.DistinguishedName -NewName "IT" -ErrorAction Stop
         Write-Host "[objects] Restored OU IT_TEMP -> IT"
+    } catch {
+        Write-Host "[objects] WARNING: could not restore OU=IT from IT_TEMP ($_). IT objects may be under OU=IT_TEMP."
     }
-} catch {
-    Write-Host "[objects] WARNING: could not restore OU=IT from IT_TEMP ($_). IT objects may be under OU=IT_TEMP."
 }
 
 function New-OU-IfMissing {
