@@ -75,6 +75,30 @@ try {
     Write-Host "[dc03_postboot] WARNING: DC verification failed: $_"
 }
 
+Write-Host "[dc03_postboot] Restoring parent OU name (IT_TEMP -> IT) on DC01..."
+# dc03_join.ps1 temporarily renamed OU=IT to IT_TEMP on DC01 before creating the
+# child domain. Rename it back now so dc01_objects.ps1 (and the IT/Workstations
+# OU references it depends on) are consistent again. If the parent OU and the
+# child domain label genuinely collide, this rename fails harmlessly and
+# dc01_objects.ps1 self-heals by using whichever name exists.
+try {
+    $ppass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+    $pcred = New-Object System.Management.Automation.PSCredential("Administrator@$domain", $ppass)
+    $parentDN = ($domain.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+    $tempOU = Get-ADOrganizationalUnit -Identity "OU=IT_TEMP,$parentDN" -Server $dc01IP -Credential $pcred -ErrorAction SilentlyContinue
+    $realOU = Get-ADOrganizationalUnit -Identity "OU=IT,$parentDN" -Server $dc01IP -Credential $pcred -ErrorAction SilentlyContinue
+    if ($tempOU -and -not $realOU) {
+        Rename-ADObject -Identity $tempOU.DistinguishedName -NewName "IT" -Server $dc01IP -Credential $pcred -ErrorAction Stop
+        Write-Host "[dc03_postboot] OU IT_TEMP renamed back to IT"
+    } elseif ($realOU) {
+        Write-Host "[dc03_postboot] OU=IT already present; nothing to restore"
+    } else {
+        Write-Host "[dc03_postboot] No IT_TEMP OU found to restore"
+    }
+} catch {
+    Write-Host "[dc03_postboot] OU rename-back skipped (left as IT_TEMP; dc01_objects self-heals): $_"
+}
+
 Write-Host "[dc03_postboot] Setting DNS forwarder..."
 try {
     Add-DnsServerForwarder -IPAddress "8.8.8.8" -ErrorAction SilentlyContinue

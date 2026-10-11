@@ -213,21 +213,12 @@ foreach ($name in $records.Keys) {
     }
 }
 
-Write-Host "[dc01_dns] Creating DNS delegation for subdomain $childDomain..."
-try {
-    Add-DnsServerZoneDelegation -Name $domain -ChildZoneName "it" -NameServer "dc03.$domain" -IPAddress $dc03IP -ErrorAction SilentlyContinue
-    Write-Host "[dc01_dns] DNS delegation: it.$domain -> dc03 ($dc03IP)"
-} catch {
-    Write-Host "[dc01_dns] DNS delegation may already exist: $_"
-}
-
-Write-Host "[dc01_dns] Adding conditional forwarder for child domain..."
-try {
-    Add-DnsServerConditionalForwarderZone -Name $childDomain -MasterServers $dc03IP -ErrorAction SilentlyContinue
-    Write-Host "[dc01_dns] Conditional forwarder for $childDomain -> $dc03IP"
-} catch {
-    Write-Host "[dc01_dns] Conditional forwarder may already exist"
-}
+# NOTE: The child-domain ('it') DNS delegation and the it.secscope.corp
+# conditional forwarder are deliberately NOT created here. Creating them before
+# DC03 is promoted makes DC01 answer authoritatively for the child zone, so
+# Install-ADDSDomain's uniqueness check aborts with "The specified domain
+# already exists". They are added AFTER DC03 promotion by dc01_child_dns.ps1
+# (the 'child-dns' provisioner), mirroring GOAD's parent_child_dns step.
 
 Write-Host "[dc01_dns] Setting domain functional level..."
 try {

@@ -53,4 +53,26 @@ Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value "Vader2024!" -Type
 Set-ItemProperty -Path $winlogon -Name AutoLogonCount -Value 5 -Type DWord -Force
 Write-Host "[ws02_misconfig] WS02 will now boot to anakin's desktop (not local Administrator) - required for the unconstrained delegation TGT-capture scenario"
 
+Write-Host "[ws02_misconfig] Installing LAPS client CSE (so the LAPS GPO can manage the local admin password)..."
+# See ws01_misconfig.ps1 for rationale. Offline-first from the synced folder,
+# else from Microsoft; idempotent and non-fatal. GP refresh applies the LAPS GPO
+# linked by dc01_objects.ps1 to OU=Workstations,OU=IT.
+if (-not (Test-Path "C:\Program Files\LAPS\CSE\AdmPwd.dll")) {
+    $lapsMsi = $null
+    if (Test-Path "C:\vagrant\LAPS.x64.msi") { $lapsMsi = "C:\vagrant\LAPS.x64.msi" }
+    else {
+        try {
+            $lapsMsi = "C:\Windows\Temp\LAPS.x64.msi"
+            Invoke-WebRequest -Uri "https://download.microsoft.com/download/C/7/A/C7AAD914-A8A6-4904-88A1-29E657445D03/LAPS.x64.msi" -OutFile $lapsMsi -TimeoutSec 60 -ErrorAction Stop
+        } catch { $lapsMsi = $null; Write-Host "[ws02_misconfig] WARNING: LAPS CSE unavailable (offline + download failed); LAPS exercise will not populate" }
+    }
+    if ($lapsMsi) {
+        Start-Process msiexec.exe -ArgumentList "/i `"$lapsMsi`" /quiet /norestart ADDLOCAL=CSE" -Wait
+        Write-Host "[ws02_misconfig] LAPS CSE installed"
+    }
+} else {
+    Write-Host "[ws02_misconfig] LAPS CSE already installed"
+}
+gpupdate /target:computer /force 2>&1 | Out-Null
+
 Write-Host "[ws02_misconfig] Done"

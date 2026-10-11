@@ -80,7 +80,11 @@ try {
     $null = Get-ADDomain -Identity $childDomain -Server $dc01IP -Credential $cred -ErrorAction Stop
     Write-Host "[dc03_join] Subdomain $childDomain already exists in forest, skipping promotion"
     exit 0
-} catch {}
+} catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+    Write-Host "[dc03_join] Child domain does not exist yet, proceeding with promotion"
+} catch {
+    Write-Host "[dc03_join] Child-domain existence check inconclusive ($_), proceeding with promotion"
+}
 
 Write-Host "[dc03_join] Installing AD-Domain-Services and DNS..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools
@@ -198,7 +202,7 @@ for ($i = 1; $i -le 5; $i++) {
     Write-Host "[dc03_join] Pre-attempt cleanup of stale child-domain metadata..."
     Remove-StaleChildDomain -ChildDN $childDN -PartitionsDN $partitionsDN -ParentDomain $domain -ChildDomain $childDomain -Server $dc01IP -Credential $cred
     try {
-        Install-ADDSDomain -NewDomainName "it" -ParentDomainName $domain -DomainType ChildDomain -NewDomainNetbiosName "ITSEC" -Credential $cred -SafeModeAdministratorPassword $dsrmSec -Force -NoRebootOnCompletion:$true -ErrorAction Stop
+        Install-ADDSDomain -NewDomainName "it" -ParentDomainName $domain -DomainType ChildDomain -NewDomainNetbiosName "ITSEC" -ReplicationSourceDC "dc01.$domain" -Credential $cred -SafeModeAdministratorPassword $dsrmSec -SkipPreChecks -Force -NoRebootOnCompletion:$true -ErrorAction Stop
         $promoted = $true
         Write-Host "[dc03_join] Subdomain install succeeded"
         Write-Host "[dc03_join] OU IT renamed to IT_TEMP for child domain compatibility."

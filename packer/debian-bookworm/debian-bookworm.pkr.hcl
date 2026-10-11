@@ -49,12 +49,15 @@ source "virtualbox-iso" "debian-bookworm" {
 
   boot_wait             = "5s"
   boot_command = [
-    "<enter>"
+    "<wait>"
   ]
 
   vboxmanage = [
-    ["modifyvm", "{{.Name}}", "--boot1", "disk"],
-    ["modifyvm", "{{.Name}}", "--boot2", "dvd"],
+    ["modifyvm", "{{.Name}}", "--boot1", "dvd"],
+    ["modifyvm", "{{.Name}}", "--boot2", "disk"],
+    ["modifyvm", "{{.Name}}", "--nictype1", "virtio"],
+    ["modifyvm", "{{.Name}}", "--uart1", "0x3F8", "4"],
+    ["modifyvm", "{{.Name}}", "--uartmode1", "file", "/tmp/packer-serial.log"],
     ["modifyvm", "{{.Name}}", "--vram", "128"],
     ["modifyvm", "{{.Name}}", "--graphicscontroller", "vmsvga"],
     ["modifyvm", "{{.Name}}", "--audio", "none"],

@@ -9,8 +9,12 @@ $dnsSuffix = if ($env:DNSSUFFIX) { $env:DNSSUFFIX } else { "secscope.corp" }
 
 Write-Host "[$logPrefix] Starting $dcName base setup..."
 
-Write-Host "[$logPrefix] Renaming computer to $dcName..."
-Rename-Computer -NewName $dcName -Force
+if ($env:COMPUTERNAME -eq $dcName) {
+    Write-Host "[$logPrefix] Computer already named $dcName (no rename needed)"
+} else {
+    Write-Host "[$logPrefix] Renaming computer to $dcName..."
+    Rename-Computer -NewName $dcName -Force
+}
 
 Write-Host "[$logPrefix] Setting static IP $dcIP on secondary adapter..."
 $adapters = Get-NetAdapter | Where-Object Status -eq 'Up'

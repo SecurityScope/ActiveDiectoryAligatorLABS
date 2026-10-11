@@ -32,10 +32,15 @@ Step-by-step instructions to go from zero to a fully working Active Directory la
    - Download: https://git-scm.com/download/win
    - Recommended: enable "Git Bash Here" during install.
 
-4. Verify from **PowerShell (Admin)**:
+4. **Python 3.8+** (runs the `setup.py` orchestrator)
+   - Download: https://www.python.org/downloads/
+   - During install, tick **"Add python.exe to PATH"**.
+
+5. Verify from **PowerShell (Admin)**:
    ```powershell
    vagrant --version          # must be >= 2.3.0
    VBoxManage --version       # must be >= 7.0
+   python --version           # must be >= 3.8
    ```
 
 > **Hyper-V conflict:** If Vagrant fails to start VMs, disable Hyper-V, Windows Sandbox, and WSL2:
@@ -92,10 +97,16 @@ Step-by-step instructions to go from zero to a fully working Active Directory la
    # Log out and back in for this to take effect
    ```
 
-4. Verify:
+4. **Python 3.8+** (runs the `setup.py` orchestrator; usually preinstalled):
+   ```bash
+   sudo apt-get install -y python3
+   ```
+
+5. Verify:
    ```bash
    vagrant --version
    vboxmanage --version
+   python3 --version
    ```
 
 ---
@@ -172,30 +183,42 @@ Get-FileHash -Algorithm SHA256 iso\Win10_22H2_English_x64v1.iso
 > values above, you may have a newer build — adjust the `iso_checksum` variable in
 > the Packer `.pkr.hcl` files, or pass it as a variable (`-var "iso_checksum=..."`).
 
+> **Edition must match the Autounattend image name.** The unattended installs
+> select a specific Windows image by name:
+> `packer/autounattend/windows-server-2022/Autounattend.xml` expects
+> **`Windows Server 2022 SERVERSTANDARD`** and
+> `packer/autounattend/windows-10/Autounattend.xml` expects **`Windows 10 Pro`**.
+> If you supply a different edition ISO (e.g. a Datacenter-only or Home/Education
+> image), Windows Setup fails with *"no image"* / *"Windows cannot find a
+> product key"*. Use the exact ISOs above, or edit the `/IMAGE/NAME` value in the
+> matching `Autounattend.xml` to an image the ISO actually contains
+> (`dism /Get-WimInfo /WimFile:<mounted>\sources\install.wim` lists them).
+>
+> The **Debian** Packer box is NOT built by default (`setup.py build-boxes`
+> skips it): its preseed build is unreliable and `lin01` boots from the public
+> `debian/bookworm64` box instead. Pass `--with-debian` only if you specifically
+> need to rebuild it.
+
 ### Build Boxes
 
-Build the Windows and Debian boxes sequentially:
+Build the two Windows boxes sequentially:
 
 ```bash
 # Build Windows Server 2022 box (~45-90 minutes)
-./setup.sh build-boxes --server-only
+python3 setup.py build-boxes --server-only
 
 # Build Windows 10 box (~45-90 minutes)
-./setup.sh build-boxes --workstation-only
-
-# Build Debian Bookworm box (~10-20 minutes)
-./setup.sh build-boxes --debian-only
+python3 setup.py build-boxes --workstation-only
 ```
 
-Or build both at once:
+Or build both Windows boxes at once (the default):
 ```bash
-./setup.sh build-boxes
+python3 setup.py build-boxes
 ```
 
-**Windows PowerShell:**
-```powershell
-powershell -ExecutionPolicy Bypass -File setup.ps1 build-boxes
-```
+> The Debian box is **not** part of the default build and is not required — `lin01`
+> boots from the public `debian/bookworm64` box. Only pass `--with-debian`
+> (or `--debian-only`) if you specifically want to rebuild the local Debian box.
 
 Verify boxes:
 ```bash
@@ -204,49 +227,68 @@ vagrant box list | grep secscope
 
 Should show:
 ```
-secscope/debian-bookworm           (virtualbox, x.x.x)
 secscope/windows-10                (virtualbox, x.x.x)
 secscope/windows-server-2022       (virtualbox, x.x.x)
 ```
+(plus `secscope/debian-bookworm` only if you built it with `--with-debian`.)
 
-If a `vagrant up` fails with "box not found", run `./setup.sh build-boxes` first.
+If a build fails with "box not found", run `python3 setup.py build-boxes` first.
 
 ---
 
 ## 5. Build the Lab
 
-### Automated Build (Recommended)
+### Per-machine build (dependency-ordered)
 
-Use the setup script to build the entire lab automatically:
+Orchestration lives in **`setup.py`** (Python 3.8+; `./setup.sh` is a thin
+wrapper). Machines are built **one at a time** in dependency order — there is no
+single "deploy everything" step. Each machine can be built only once (a second
+attempt is refused unless you use `rebuild` or `--force`).
 
-**Linux / macOS:**
+**Build order (hard-enforced):**
+```
+dc01  ->  dc02  ->  dc03            (dc03 needs BOTH dc01 and dc02)
+dc01  ->  {srv01, ws01, ws02, lin01}
+```
+
 ```bash
-./setup.sh
+python3 setup.py build dc01          # forest root — build first
+python3 setup.py build dc02          # requires dc01 running + provisioned
+python3 setup.py build dc03          # requires dc01 AND dc02
+python3 setup.py build srv01         # requires dc01
+python3 setup.py build ws01 ws02 lin01
 ```
 
-**Windows PowerShell:**
-```powershell
-powershell -ExecutionPolicy Bypass -File setup.ps1
+Build several or all at once (still dependency-ordered):
+```bash
+python3 setup.py build all                 # sequential, in order
+python3 setup.py build all --parallel       # overlap independent VMs
+python3 setup.py build all --max-parallel 2 # cap concurrency (default 2)
 ```
 
-The script runs all `vagrant up` and `vagrant provision` commands in the correct dependency order,
-handles reloads automatically, runs DC02+DC03 joins in parallel, and performs a final AD objects pass
-after all VMs are up. Total build time: ~75-90 minutes.
+If a dependency is missing, the build aborts immediately with a message telling
+you exactly what to build first. Check state any time with:
+```bash
+python3 setup.py status
+```
 
 ### Build Options
 
 ```bash
-# Build only DC01 (test environment)
-./setup.sh deploy --dc01-only
+python3 setup.py build dc01 --force     # override the one-time build guard
+python3 setup.py rebuild ws01           # destroy + rebuild a single machine
+python3 setup.py build dc01 --verbose   # full provisioning output
+python3 setup.py build dc01 --quiet     # minimal output
+```
 
-# Deploy specific VMs only
-./setup.sh deploy --vms dc01,ws01,srv01
+### Locking down (optional, after building)
 
-# Skip certain steps
-./setup.sh deploy --skip-services    # Skip SRV01 IIS/SQL/ADCS
-./setup.sh deploy --skip-misconfig   # Skip WS01/WS02 vulnerabilities
-./setup.sh deploy --skip-hardening   # Skip vagrant account disable
-./setup.sh deploy --skip-linux       # Skip LIN01
+`harden` and `seal` are deliberate, separate steps because they cut off Vagrant
+management. Run them only when the machines are finished:
+```bash
+python3 setup.py harden all          # remove vagrant credentials
+python3 setup.py seal all            # single-home each VM on 192.168.200.x
+python3 setup.py unseal <vm>         # (reverse a seal to regain management)
 ```
 
 ---

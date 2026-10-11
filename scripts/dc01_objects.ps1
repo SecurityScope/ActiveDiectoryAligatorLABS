@@ -38,6 +38,23 @@ $domainDN  = (Get-ADDomain).DistinguishedName
 
 Write-Host "[objects] Domain DN: $domainDN"
 
+# Self-heal: dc03_join.ps1 temporarily renames OU=IT to IT_TEMP while creating
+# the child domain, and dc03_postboot.ps1 renames it back. If that back-rename
+# didn't run yet (build order) or failed, restore it here (locally, as the DC's
+# own Administrator) so every "OU=IT,$domainDN" reference below resolves. This
+# makes a re-run of this script (e.g. the per-member ACL pass) build-order
+# independent instead of silently recreating an empty OU=IT alongside IT_TEMP.
+try {
+    $itTemp = Get-ADOrganizationalUnit -Identity "OU=IT_TEMP,$domainDN" -ErrorAction SilentlyContinue
+    $itReal = Get-ADOrganizationalUnit -Identity "OU=IT,$domainDN" -ErrorAction SilentlyContinue
+    if ($itTemp -and -not $itReal) {
+        Rename-ADObject -Identity $itTemp.DistinguishedName -NewName "IT" -ErrorAction Stop
+        Write-Host "[objects] Restored OU IT_TEMP -> IT"
+    }
+} catch {
+    Write-Host "[objects] WARNING: could not restore OU=IT from IT_TEMP ($_). IT objects may be under OU=IT_TEMP."
+}
+
 function New-OU-IfMissing {
     param($Name, $Path)
     try {
@@ -361,14 +378,55 @@ try {
 # LAPS permissions -- grant han read access to LAPS passwords
 # ══════════════════════════════════════════════════════════════════════════
 
-Write-Host "[objects] Configuring LAPS permissions..."
+Write-Host "[objects] Configuring LAPS (schema, self-permission, read grant, GPO)..."
+$workstationsOU = "OU=Workstations,OU=IT,$domainDN"
 try {
     Import-Module AdmPwd.PS -ErrorAction Stop
-    $workstationsOU = "OU=Workstations,OU=IT,$domainDN"
-    Set-AdmPwdReadPasswordPermission -Identity $workstationsOU -AllowedPrincipals "han" -ErrorAction SilentlyContinue
+
+    # 1) Extend the schema with ms-Mcs-AdmPwd* (idempotent; needs Schema Admin,
+    #    which the forest-root Administrator is a member of). Without this the
+    #    attribute doesn't exist and nothing can store/read a LAPS password.
+    try {
+        Update-AdmPwdADSchema -ErrorAction Stop | Out-Null
+        Write-Host "[objects] LAPS schema extended (ms-Mcs-AdmPwd)"
+    } catch {
+        Write-Host "[objects] LAPS schema already extended or skipped: $_"
+    }
+
+    # 2) Let the managed computers write their own password back to AD.
+    Set-AdmPwdComputerSelfPermission -OrgUnit $workstationsOU -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "[objects] LAPS computer self-permission set on Workstations OU"
+
+    # 3) Grant han read of the managed password (the intended abuse path).
+    Set-AdmPwdReadPasswordPermission -Identity $workstationsOU -AllowedPrincipals "han" -ErrorAction SilentlyContinue | Out-Null
     Write-Host "[objects] LAPS read permission granted to han on Workstations OU"
+
+    # 4) Create + link a GPO that turns LAPS management ON for the OU. The client
+    #    CSE (installed on ws01/ws02 by their misconfig scripts) only populates
+    #    ms-Mcs-AdmPwd when this policy is enabled.
+    try {
+        Import-Module GroupPolicy -ErrorAction Stop
+        $lapsGpoName = "LAPS"
+        if (-not (Get-GPO -Name $lapsGpoName -ErrorAction SilentlyContinue)) {
+            New-GPO -Name $lapsGpoName -ErrorAction Stop | Out-Null
+            Write-Host "[objects] Created GPO '$lapsGpoName'"
+        }
+        $lapsKey = "HKLM\Software\Policies\Microsoft Services\AdmPwd"
+        Set-GPRegistryValue -Name $lapsGpoName -Key $lapsKey -ValueName "AdmPwdEnabled" -Type DWord -Value 1 -ErrorAction SilentlyContinue | Out-Null
+        Set-GPRegistryValue -Name $lapsGpoName -Key $lapsKey -ValueName "PasswordComplexity" -Type DWord -Value 4 -ErrorAction SilentlyContinue | Out-Null
+        Set-GPRegistryValue -Name $lapsGpoName -Key $lapsKey -ValueName "PasswordLength" -Type DWord -Value 14 -ErrorAction SilentlyContinue | Out-Null
+        Set-GPRegistryValue -Name $lapsGpoName -Key $lapsKey -ValueName "PasswordAgeDays" -Type DWord -Value 30 -ErrorAction SilentlyContinue | Out-Null
+        $existingLink = (Get-GPInheritance -Target $workstationsOU -ErrorAction SilentlyContinue).GpoLinks |
+            Where-Object { $_.DisplayName -eq $lapsGpoName }
+        if (-not $existingLink) {
+            New-GPLink -Name $lapsGpoName -Target $workstationsOU -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
+        }
+        Write-Host "[objects] LAPS GPO linked to $workstationsOU"
+    } catch {
+        Write-Host "[objects] LAPS GPO create/link skipped: $_"
+    }
 } catch {
-    Write-Host "[objects] NOTE: AdmPwd.PS module not available. Install LAPS on DC01 (via dc01_postboot.ps1) and run: Set-AdmPwdReadPasswordPermission -Identity 'OU=Workstations,OU=IT,$domainDN' -AllowedPrincipals 'han'"
+    Write-Host "[objects] NOTE: AdmPwd.PS module not available. Install LAPS on DC01 (dc01_dns.ps1 does this) then re-run 'objects'. Needed: Update-AdmPwdADSchema; Set-AdmPwdComputerSelfPermission -OrgUnit '$workstationsOU'; Set-AdmPwdReadPasswordPermission -Identity '$workstationsOU' -AllowedPrincipals 'han'."
 }
 
 # ══════════════════════════════════════════════════════════════════════════

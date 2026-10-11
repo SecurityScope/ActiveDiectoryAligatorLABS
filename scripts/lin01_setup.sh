@@ -6,6 +6,23 @@ DOMAIN_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
 
 echo "[lin01] Starting setup..."
 
+# Detect the internal (natnetwork) NIC by exclusion rather than assuming eth1:
+# the debian/bookworm64 box may name it eth1, enp0s8, ens6, ... The management
+# NIC is the one carrying the default route (VirtualBox NAT); the internal NIC
+# is the other ethernet device.
+MGMT_IF=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+INT_IF=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+    | grep -E '^(eth|en|ens|enp)' | grep -v "^${MGMT_IF}$" | head -n1)
+INT_IF=${INT_IF:-eth1}
+echo "[lin01] Internal NIC detected: $INT_IF (mgmt: ${MGMT_IF:-unknown}) -> $LIN01_IP"
+cat > /etc/network/interfaces.d/${INT_IF}.cfg <<EOF
+auto $INT_IF
+iface $INT_IF inet static
+    address $LIN01_IP/24
+EOF
+ip link set "$INT_IF" up 2>/dev/null || true
+ip addr add "$LIN01_IP/24" dev "$INT_IF" 2>/dev/null || true
+
 echo "[lin01] Installing required packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -80,7 +97,26 @@ for i in $(seq 1 30); do
 done
 
 echo "[lin01] Joining domain $DOMAIN_LOWER..."
-realm join --user=Administrator "$DOMAIN_LOWER" -v <<< "$ADMIN_PASS" 2>&1 | tail -5
+# Pipe to `tail` was masking the realm-join exit status from `set -e` (PIPESTATUS
+# of the pipeline is tail's), so a failed join was silently treated as success.
+# Feed the password on stdin (--stdin-password where supported, else here-string)
+# and check realm's own exit status explicitly.
+join_rc=0
+if realm join --help 2>&1 | grep -q -- '--stdin-password'; then
+    printf '%s' "$ADMIN_PASS" | realm join --user=Administrator --stdin-password "$DOMAIN_LOWER" -v || join_rc=$?
+else
+    realm join --user=Administrator "$DOMAIN_LOWER" -v <<< "$ADMIN_PASS" || join_rc=$?
+fi
+if [ "$join_rc" -ne 0 ]; then
+    if realm list 2>/dev/null | grep -qi "$DOMAIN_LOWER"; then
+        echo "[lin01] realm join returned $join_rc but host is already joined ($DOMAIN_LOWER); continuing"
+    else
+        echo "[lin01] ERROR: realm join failed (rc=$join_rc) and host is not joined to $DOMAIN_LOWER"
+        exit 1
+    fi
+else
+    echo "[lin01] realm join succeeded"
+fi
 
 echo "[lin01] Enabling SSH with password auth..."
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config

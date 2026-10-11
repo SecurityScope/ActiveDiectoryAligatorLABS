@@ -34,7 +34,20 @@ try {
     Write-Host "[srv01_services] Extracting $($expr.Name)..."
     Start-Process $expr.FullName -ArgumentList "/Q /X:$extract" -Wait
     Write-Host "[srv01_services] Installing SQL engine from extracted media..."
-    Start-Process "$extract\SETUP.EXE" -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"SECSCOPE\SQLAdmins`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
+    # /SQLSYSADMINACCOUNTS must name a principal SQL setup can resolve or the
+    # install aborts. SECSCOPE\SQLAdmins is created by dc01_objects.ps1 - if that
+    # hasn't propagated (or the group isn't resolvable yet), fall back to
+    # SECSCOPE\Domain Admins (always present) so the engine still installs. The
+    # SQLAdmins sysadmin role is re-asserted later via T-SQL in any case.
+    $sysadminAccounts = "SECSCOPE\Domain Admins"
+    try {
+        $null = (New-Object System.Security.Principal.NTAccount("SECSCOPE","SQLAdmins")).Translate([System.Security.Principal.SecurityIdentifier])
+        $sysadminAccounts = "SECSCOPE\SQLAdmins SECSCOPE\Domain Admins"
+        Write-Host "[srv01_services] SQLAdmins group resolved; using it for SQL sysadmin"
+    } catch {
+        Write-Host "[srv01_services] WARNING: SECSCOPE\SQLAdmins not resolvable yet; installing with Domain Admins as sysadmin"
+    }
+    Start-Process "$extract\SETUP.EXE" -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"$sysadminAccounts`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
     if (Get-Service "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue) {
         Write-Host "[srv01_services] SQL Server Express installed"
         $sqlInstalled = $true

@@ -90,26 +90,51 @@ Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dc01IP
 Clear-DnsClientCache
 
 Write-Host "[$logPrefix] Verifying DNS resolution of $domain..."
+# Use nslookup against DC01 directly, NOT Resolve-DnsName: with the NAT adapter's
+# --natdnshostresolver1 on, Resolve-DnsName round-robins and caches a false
+# NXDOMAIN from the host resolver (ISSUE_REPORT Issue 1), which aborts the join
+# even though the DC answers fine. nslookup queries the specified server only.
 $dnsOk = $false
 for ($i = 1; $i -le 6; $i++) {
-    try {
-        $resolved = Resolve-DnsName $domain -ErrorAction Stop
-        Write-Host "[$logPrefix] $domain resolved OK"
+    $srv = nslookup -type=SRV "_ldap._tcp.$domain" $dc01IP 2>&1
+    if ($srv -match "$([regex]::Escape($domain))") {
+        Write-Host "[$logPrefix] $domain SRV records resolved via nslookup"
         $dnsOk = $true
         break
-    } catch {
-        Write-Host "[$logPrefix] DNS attempt $i/6..."
-        Start-Sleep 3
     }
+    Write-Host "[$logPrefix] DNS attempt $i/6..."
+    Start-Sleep 3
 }
 if (-not $dnsOk) {
-    Write-Host "[$logPrefix] ERROR: Cannot resolve $domain"
+    Write-Host "[$logPrefix] ERROR: Cannot resolve $domain (SRV) via $dc01IP"
     exit 1
 }
 
 Write-Host "[$logPrefix] Joining domain $domain..."
 $password = ConvertTo-SecureString $adminPass -AsPlainText -Force
 $cred = New-Object PSCredential("Administrator@$domain", $password)
+
+# Resolve a target OU so this machine lands where its GPOs/ACLs expect it
+# (e.g. workstations in OU=Workstations,OU=IT so the LAPS GPO + read ACL apply).
+# VM_OU is a relative path (e.g. "OU=Workstations,OU=IT"); append the domain DN.
+# If the child-domain build left OU=IT temporarily renamed to IT_TEMP, fall back
+# to that; if neither resolves, omit -OUPath (default CN=Computers container).
+$ouPath = $null
+if ($env:VM_OU) {
+    $domainDN = ($domain.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+    $candidates = @("$($env:VM_OU),$domainDN", "$($env:VM_OU -replace 'OU=IT','OU=IT_TEMP'),$domainDN")
+    foreach ($cand in $candidates) {
+        try {
+            $null = Get-ADObject -Identity $cand -Server $dc01IP -Credential $cred -ErrorAction Stop
+            $ouPath = $cand
+            Write-Host "[$logPrefix] Target OU resolved: $ouPath"
+            break
+        } catch { }
+    }
+    if (-not $ouPath) {
+        Write-Host "[$logPrefix] WARNING: VM_OU '$($env:VM_OU)' not found; joining into default Computers container"
+    }
+}
 
 $joined = $false
 for ($i = 1; $i -le 5; $i++) {
@@ -120,6 +145,9 @@ for ($i = 1; $i -le 5; $i++) {
             Credential = $cred
             Force      = $true
             ErrorAction = "Stop"
+        }
+        if ($ouPath) {
+            $addParams["OUPath"] = $ouPath
         }
         if ($env:COMPUTERNAME -ne $vmName) {
             $addParams["NewName"] = $vmName

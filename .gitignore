@@ -11,6 +11,14 @@ packer/boxes/*.box
 iso/*.iso
 *.iso
 *.img
+# ...including working copies / backups of ISOs that slip past "*.iso"
+iso/*.bak
+iso/*.orig
+*.iso.*
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # VM artifacts
 *.ova
@@ -46,3 +54,8 @@ doc/
 
 # Temp directory
 /temp
+
+
+# Labs based material
+
+Attacking_Active_Directory/

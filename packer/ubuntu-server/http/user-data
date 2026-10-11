@@ -1,0 +1,28 @@
+#cloud-config
+autoinstall:
+  version: 1
+  identity:
+    hostname: ubuntu-server
+    username: vagrant
+    password: "$6$2G5RXhK8/87VVgrA$oBJwR6q.agwRVLfOKEdPfSEQvVwWH6ot1biVy40qxZeLG0VckEDaavdTb8zBVEy.AgjXVQ8BLlW5xftHSAlnK/"
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: UTC
+  storage:
+    layout:
+      name: lvm
+  ssh:
+    install-server: true
+    allow-pw: true
+  packages:
+    - openssh-server
+    - sudo
+    - build-essential
+    - dkms
+    - linux-headers-generic
+  late-commands:
+    - "sed -i '/PermitRootLogin/c\\PermitRootLogin yes' /target/etc/ssh/sshd_config"
+    - "sed -i '/PasswordAuthentication/c\\PasswordAuthentication yes' /target/etc/ssh/sshd_config"
+    - "echo 'vagrant ALL=(ALL) NOPASSWD: ALL' > /target/etc/sudoers.d/vagrant"
+    - "chmod 440 /target/etc/sudoers.d/vagrant"

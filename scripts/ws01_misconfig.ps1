@@ -100,4 +100,27 @@ Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value "Vader2024!" -Type
 Set-ItemProperty -Path $winlogon -Name AutoLogonCount -Value 5 -Type DWord -Force
 Write-Host "[ws01_misconfig] WS01 will now boot to anakin's desktop (not local Administrator)"
 
+Write-Host "[ws01_misconfig] Installing LAPS client CSE (so the LAPS GPO can manage the local admin password)..."
+# The LAPS attack path (han reads ms-Mcs-AdmPwd) only works if this host runs
+# the LAPS Group Policy client-side extension and the LAPS GPO (linked by
+# dc01_objects.ps1 to OU=Workstations,OU=IT) is applied. Install the CSE
+# (offline-first from the synced folder, else from Microsoft), then refresh GP.
+if (-not (Test-Path "C:\Program Files\LAPS\CSE\AdmPwd.dll")) {
+    $lapsMsi = $null
+    if (Test-Path "C:\vagrant\LAPS.x64.msi") { $lapsMsi = "C:\vagrant\LAPS.x64.msi" }
+    else {
+        try {
+            $lapsMsi = "C:\Windows\Temp\LAPS.x64.msi"
+            Invoke-WebRequest -Uri "https://download.microsoft.com/download/C/7/A/C7AAD914-A8A6-4904-88A1-29E657445D03/LAPS.x64.msi" -OutFile $lapsMsi -TimeoutSec 60 -ErrorAction Stop
+        } catch { $lapsMsi = $null; Write-Host "[ws01_misconfig] WARNING: LAPS CSE unavailable (offline + download failed); LAPS exercise will not populate" }
+    }
+    if ($lapsMsi) {
+        Start-Process msiexec.exe -ArgumentList "/i `"$lapsMsi`" /quiet /norestart ADDLOCAL=CSE" -Wait
+        Write-Host "[ws01_misconfig] LAPS CSE installed"
+    }
+} else {
+    Write-Host "[ws01_misconfig] LAPS CSE already installed"
+}
+gpupdate /target:computer /force 2>&1 | Out-Null
+
 Write-Host "[ws01_misconfig] Done"

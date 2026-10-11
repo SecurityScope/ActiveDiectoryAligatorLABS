@@ -17,20 +17,36 @@ end
 
 require_relative 'vagrant_plugins/winrm_quiet'
 
-DOMAIN        = "secscope.corp"
-DOMAIN_UPPER  = "SECSCOPE"
-CHILD_DOMAIN  = "it.secscope.corp"
-CHILD_UPPER   = "IT"
-DC01_IP       = "192.168.200.10"
-DC02_IP       = "192.168.200.11"
-DC03_IP       = "192.168.200.12"
-SRV01_IP      = "192.168.200.20"
-WS01_IP       = "192.168.200.30"
-WS02_IP       = "192.168.200.31"
-LIN01_IP      = "192.168.200.40"
-KALI_IP       = "192.168.200.99"
-ADMIN_PASS    = "SecScope2024!"
-DSRM_PASS     = "DsrmPass2024!"
+# ─── Load lab.conf (single source of truth) ──────────────────────────────
+# Flat KEY=value file shared with setup.sh / setup.ps1 so domain, IPs, boxes
+# and passwords live in exactly one place.
+_lab_conf = {}
+_conf_path = File.join(File.dirname(__FILE__), 'lab.conf')
+if File.exist?(_conf_path)
+  File.foreach(_conf_path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?('#')
+    key, _, val = line.partition('=')
+    _lab_conf[key.strip] = val.strip
+  end
+else
+  abort "ERROR: lab.conf not found at #{_conf_path}"
+end
+
+DOMAIN        = _lab_conf['DOMAIN']
+DOMAIN_UPPER  = _lab_conf['DOMAIN_UPPER']
+CHILD_DOMAIN  = _lab_conf['CHILD_DOMAIN']
+CHILD_UPPER   = _lab_conf['CHILD_UPPER']
+DC01_IP       = _lab_conf['DC01_IP']
+DC02_IP       = _lab_conf['DC02_IP']
+DC03_IP       = _lab_conf['DC03_IP']
+SRV01_IP      = _lab_conf['SRV01_IP']
+WS01_IP       = _lab_conf['WS01_IP']
+WS02_IP       = _lab_conf['WS02_IP']
+LIN01_IP      = _lab_conf['LIN01_IP']
+KALI_IP       = _lab_conf['KALI_IP']
+ADMIN_PASS    = _lab_conf['ADMIN_PASS']
+DSRM_PASS     = _lab_conf['DSRM_PASS']
 
 # Domain Controllers (dc01, dc02, dc03) lose their local SAM database once
 # they are promoted (Install-ADDSForest / Install-ADDSDomainController) -
@@ -46,11 +62,15 @@ DSRM_PASS     = "DsrmPass2024!"
 # environment - setup.sh does this automatically.
 DC_WINRM_PASSWORD = ENV['DC_WINRM_PASSWORD'] || "vagrant"
 
-SERVER_BOX      = "secscope/windows-server-2022"
-WORKSTATION_BOX = "secscope/windows-10"
+SERVER_BOX      = _lab_conf['SERVER_BOX']
+WORKSTATION_BOX = _lab_conf['WORKSTATION_BOX']
 
 # ─── Helper: define a Windows VM with common boilerplate ─────────────────
-
+# NOTE: `ip:` is informational only (documents each VM's intended internal
+# address at the call site). There is no `private_network` stanza - the static
+# 192.168.200.x address is assigned inside the guest by dc_base.ps1 /
+# domain_join.ps1 on the natnetwork adapter, so this parameter is NOT applied
+# here. It is kept so callers read as a self-documenting inventory.
 def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: SERVER_BOX, rdp_port: nil, winrm_port: nil, domain_controller: false)
   config.vm.define name do |vm|
     vm.vm.box = box
@@ -62,6 +82,14 @@ def define_windows_vm(config, name:, ip:, memory: 2048, cpus: 2, box: SERVER_BOX
       vm.winrm.username = "vagrant"
       vm.winrm.password = "vagrant"
     end
+
+    # The Packer boxes already ship functional Guest Additions (shared folders
+    # + WinRM work). vagrant-vbguest's auto-rebuild re-uploads the 53 MB ISO
+    # over WinRM on every boot, which is fragile: it intermittently fails with
+    # "Bad HTTP response (400)" or WSMAN "Not enough memory" and aborts the
+    # boot (destroying ws01/ws02 mid-build). The host/guest version mismatch is
+    # cosmetic, so disable the rebuild for all Windows VMs.
+    vm.vbguest.auto_update = false if Vagrant.has_plugin?("vagrant-vbguest")
 
     if rdp_port
       vm.vm.network "forwarded_port", guest: 3389, host: rdp_port, auto_correct: true
@@ -192,6 +220,13 @@ Vagrant.configure("2") do |config|
       path: "scripts/dc01_av_update_gpo.ps1", env: {
         "DOMAIN" => DOMAIN
       }
+
+    vm.vm.provision "child-dns", type: "shell", run: "never",
+      path: "scripts/dc01_child_dns.ps1", env: {
+        "DOMAIN"       => DOMAIN,
+        "CHILD_DOMAIN" => CHILD_DOMAIN,
+        "DC03_IP"      => DC03_IP
+      }
   end
 
   # ─── DC02 ─── Secondary Domain Controller ─────────────────────────────────
@@ -277,6 +312,7 @@ Vagrant.configure("2") do |config|
       "DC01_IP"      => DC01_IP,
       "VM_IP"        => SRV01_IP,
       "VM_NAME"      => "SRV01",
+      "VM_OU"        => "OU=Servers",
       "LOG_PREFIX"   => "srv01_join"
     }
 
@@ -302,6 +338,7 @@ Vagrant.configure("2") do |config|
       "DC01_IP"      => DC01_IP,
       "VM_IP"        => WS01_IP,
       "VM_NAME"      => "WS01",
+      "VM_OU"        => "OU=Workstations,OU=IT",
       "LOG_PREFIX"   => "ws01_join"
     }
 
@@ -326,6 +363,7 @@ Vagrant.configure("2") do |config|
       "DC01_IP"      => DC01_IP,
       "VM_IP"        => WS02_IP,
       "VM_NAME"      => "WS02",
+      "VM_OU"        => "OU=Workstations,OU=IT",
       "LOG_PREFIX"   => "ws02_join"
     }
 
@@ -338,9 +376,18 @@ Vagrant.configure("2") do |config|
   # ─── LIN01 ─── Debian Linux Domain Member ─────────────────────────────────
 
   config.vm.define "lin01" do |vm|
-    vm.vm.box = "secscope/debian-bookworm"
+    vm.vm.box = "debian/bookworm64"
     vm.ssh.username = "vagrant"
-    vm.ssh.password = "vagrant"
+    vm.ssh.insert_key = false
+
+    # The debian/bookworm64 box ships GuestAdditions 6.0.0 while the host runs
+    # VirtualBox 7.2. vagrant-vbguest tries to rebuild them on boot, which runs
+    # `apt-get install linux-headers-$(uname -r)` - a headers package that is
+    # not present in the box's apt sources (E: Unable to locate package
+    # linux-headers-6.1.0-29-amd64), aborting the boot. lin01 relies on the
+    # uploaded shell provisioner, not shared folders, so GuestAdditions are not
+    # needed here - disable the auto-rebuild.
+    vm.vbguest.auto_update = false if Vagrant.has_plugin?("vagrant-vbguest")
 
     vm.vm.network "forwarded_port", guest: 22, host: 22240, auto_correct: true
 
@@ -358,7 +405,8 @@ Vagrant.configure("2") do |config|
     vm.vm.provision "setup", type: "shell", path: "scripts/lin01_setup.sh", env: {
       "DOMAIN"     => DOMAIN,
       "DC01_IP"    => DC01_IP,
-      "ADMIN_PASS" => ADMIN_PASS
+      "ADMIN_PASS" => ADMIN_PASS,
+      "LIN01_IP"   => LIN01_IP
     }
 
     # Fully remove the vagrant account. Set a root password FIRST (to ADMIN_PASS)

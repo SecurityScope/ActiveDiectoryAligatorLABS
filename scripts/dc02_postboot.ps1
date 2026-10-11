@@ -27,13 +27,13 @@ foreach ($a in $adapters) {
 }
 Clear-DnsClientCache
 
-Write-Host "[dc02_postboot] Adding conditional forwarder for child domain..."
-try {
-    Add-DnsServerConditionalForwarderZone -Name "it.secscope.corp" -MasterServers $dc03IP -ErrorAction SilentlyContinue
-    Write-Host "[dc02_postboot] Conditional forwarder for it.secscope.corp -> $dc03IP"
-} catch {
-    Write-Host "[dc02_postboot] Conditional forwarder may already exist: $_"
-}
+# NOTE: The child-domain ('it.secscope.corp') conditional forwarder is NOT
+# created here. DC02 runs during the DC02 build, BEFORE DC03 exists, so pointing
+# a forwarder at $dc03IP would reference a non-existent server and mirrors the
+# exact constraint dc01_dns.ps1 / dc01_child_dns.ps1 call out. DC02 is a replica
+# DC in the same domain, so it resolves the child via the AD-integrated NS
+# delegation in the parent zone (created by dc01_child_dns after DC03 promotes),
+# which replicates to DC02 automatically - no per-server forwarder needed.
 
 Write-Host "[dc02_postboot] Forcing NLA re-detection (Private -> DomainAuthenticated)..."
 $internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {

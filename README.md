@@ -28,7 +28,9 @@ This Vagrant project deploys a realistic Active Directory lab covering:
 
 ## Quick Start
 
-Place Windows ISOs in the `iso/` directory, then build and deploy:
+Orchestration is driven by **`setup.py`** (Python 3.8+, standard library only).
+`./setup.sh` is a thin wrapper that just calls it. Machines are built **one at a
+time, in dependency order** — there is no "deploy everything" mega-command.
 
 ```bash
 # 1. Place ISOs
@@ -36,48 +38,65 @@ Place Windows ISOs in the `iso/` directory, then build and deploy:
 #    iso/Win10_22H2_English_x64v1.iso     (Windows 10)
 
 # 2. Build Packer boxes (~45-90 min each, sequential)
-./setup.sh build-boxes
+python3 setup.py build-boxes
 
-# 3. Deploy the lab (~75-90 minutes)
-./setup.sh
+# 3. Build the lab machine-by-machine, in dependency order
+python3 setup.py build dc01          # forest root (build first)
+python3 setup.py build dc02          # requires dc01
+python3 setup.py build dc03          # requires dc01 AND dc02
+python3 setup.py build srv01 ws01 ws02 lin01   # members (require dc01)
+
+#    ...or build everything at once, still dependency-ordered:
+python3 setup.py build all           # add --parallel to overlap members
+
+# 4. (optional, when finished) lock the lab down
+python3 setup.py harden all          # remove vagrant creds (severs Vagrant mgmt)
+python3 setup.py seal all            # single-home each VM on 192.168.200.x
 ```
 
-**Windows PowerShell:**
-```powershell
-powershell -ExecutionPolicy Bypass -File setup.ps1 build-boxes
-powershell -ExecutionPolicy Bypass -File setup.ps1
-```
+> **python3 required.** Install from https://www.python.org/downloads/ (Debian/Ubuntu: `sudo apt install python3`). `./setup.sh` forwards to `setup.py`.
 
 > **Windows evaluation period:** Both Windows boxes are built from evaluation ISOs valid for 180 days. After expiration, Windows will shut down every hour. Check remaining time: `slmgr /dli`. Rearm (up to 3 times): `slmgr /rearm`.
 
 ## Setup Script Options
 
-The `setup.sh` / `setup.ps1` scripts support multiple subcommands and options:
+`setup.py` builds **one machine at a time** with hard dependency enforcement and
+a one-time build guard (an already-built VM is refused unless you use `rebuild`
+or `--force`, to avoid resource damage). Run `python3 setup.py help` for the full
+reference.
 
 ```bash
 # Build boxes
-./setup.sh build-boxes              # Build all boxes
-./setup.sh build-boxes --server-only   # Server 2022 only
-./setup.sh build-boxes --workstation-only  # Windows 10 only
-./setup.sh build-boxes --debian-only  # Debian only
+python3 setup.py build-boxes                 # Build the two Windows boxes (default)
+python3 setup.py build-boxes --server-only   # Server 2022 only
+python3 setup.py build-boxes --workstation-only  # Windows 10 only
+python3 setup.py build-boxes --with-debian   # also build the (optional) Debian box
 
-# Deploy (default)
-./setup.sh                          # Full deploy, all VMs
-./setup.sh deploy --dc01-only       # Build only DC01
-./setup.sh deploy --vms dc01,ws01   # Deploy specific VMs only
-./setup.sh deploy --skip-misconfig  # Skip WS01/WS02 misconfigurations
-./setup.sh deploy --skip-hardening  # Skip vagrant account hardening
-./setup.sh deploy --skip-linux      # Skip LIN01
+# Build machines (dependency-ordered, one-at-a-time)
+python3 setup.py build dc01                  # single machine
+python3 setup.py build srv01 ws01 ws02       # several (sequential)
+python3 setup.py build all                   # everything in order
+python3 setup.py build all --parallel        # overlap independent VMs
+python3 setup.py build all --max-parallel 2  # cap concurrency (default 2)
+python3 setup.py rebuild ws01                # destroy + rebuild one VM
+python3 setup.py build dc01 --force          # override the one-time guard
 
-# Output control
-./setup.sh deploy --verbose         # Show all provisioning output
-./setup.sh deploy --quiet           # Minimal output
-./setup.sh deploy --debug           # Show suppressed WinRM errors
+# Dependency map (hard-blocking):
+#   dc01  <- (none)          dc02 <- dc01        dc03 <- dc01, dc02
+#   srv01 <- dc01            ws01 <- dc01        ws02 <- dc01   lin01 <- dc01
+
+# Output control (any command)
+python3 setup.py build dc01 --verbose        # show all provisioning output
+python3 setup.py build dc01 --quiet          # minimal output
+python3 setup.py build dc01 --debug          # show suppressed WinRM errors
 
 # Management
-./setup.sh status                   # Show VM states
-./setup.sh destroy                  # Destroy all VMs
-./setup.sh help                     # Show full help
+python3 setup.py status                      # live table of all VM states
+python3 setup.py harden <vm>|all             # remove vagrant creds (post-build)
+python3 setup.py seal <vm>|all               # remove NAT nic1 (single-homed)
+python3 setup.py unseal <vm>|all             # restore NAT nic1 (re-enable mgmt)
+python3 setup.py destroy <vm>|all            # destroy machine(s)
+python3 setup.py help                        # full help + dependency map
 ```
 
 ## VM Inventory
@@ -253,15 +272,15 @@ vagrant provision lin01 --provision-with setup
 
 ## After Running Hardening
 
-Once the `harden` provisioner runs:
-- The `vagrant` account is disabled on all Windows VMs
+Once the `harden` command runs (`python3 setup.py harden <vm>|all`):
+- The `vagrant` account is disabled/removed on the targeted Windows VMs
 - WinRM basic auth is disabled
 - `vagrant reload`, `vagrant provision`, and `vagrant winrm` commands will NO LONGER WORK
 
-Only run hardening when the lab is fully built and ready. To rebuild:
+Only harden a machine when it is fully built and ready. To rebuild from scratch:
 ```bash
-./setup.sh destroy
-./setup.sh
+python3 setup.py destroy all
+python3 setup.py build all
 ```
 
 ## Snapshots
@@ -289,7 +308,7 @@ All VMs connect via a VirtualBox NAT Network named `SECSCOPE.CORP` (subnet `192.
 
 **WinRM timeout:** Windows VMs are slow on first boot. The Vagrantfile sets `boot_timeout = 300` and `winrm.timeout = 180`. If you still get timeouts, increase these values in the Vagrantfile.
 
-**Box not found:** Windows and Debian boxes must be built with `./setup.sh build-boxes` before running `vagrant up`.
+**Box not found:** The two Windows boxes must be built with `python3 setup.py build-boxes` before building any machine (`setup.py build` now preflight-checks this and tells you). `lin01` uses the public `debian/bookworm64` box, fetched automatically.
 
 **"WS01 not found" during objects provisioning:** Computers must be domain-joined before `dc01_objects.ps1` can apply ACLs to them. The setup scripts run a final objects pass after all VMs are up.
 
