@@ -1142,7 +1142,13 @@ def cmd_build_boxes(opts):
         rc, checksum = run(["sha256sum", iso], capture=True)
         checksum = checksum.split()[0]
         run(["packer", "init", str(pkr_dir)])
-        rc, _ = run(["packer", "build", "-var", f"iso_path={iso}",
+        # -force so a leftover output dir from a previous failed/cancelled build
+        # (packer/builds/<name>) is overwritten instead of aborting with
+        # "Output directory exists". Also proactively clear any stale .box.
+        stale_box = SCRIPT_DIR / "packer" / "boxes" / f"{name}.box"
+        if stale_box.exists():
+            stale_box.unlink()
+        rc, _ = run(["packer", "build", "-force", "-var", f"iso_path={iso}",
                      "-var", f"iso_checksum={checksum}",
                      str(pkr_dir / f"{name}.pkr.hcl")])
         if rc != 0:
