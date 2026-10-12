@@ -16,12 +16,15 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name RunAsP
 Write-Host "[ws01_misconfig] LSA protection disabled"
 
 Write-Host "[ws01_misconfig] Enabling NTLMv1 (downgrade for hash capture)..."
-New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Force | Out-Null
+# The Lsa key always exists; New-Item -Force on an existing key throws "Cannot
+# delete a subkey tree..." - so just set the value.
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name LMCompatibilityLevel -Value 0 -Type DWORD -Force
 Write-Host "[ws01_misconfig] NTLMv1 enabled (LMCompatibilityLevel=0)"
 
 Write-Host "[ws01_misconfig] Enabling LLMNR and mDNS (multicast name resolution poisoning targets)..."
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Force | Out-Null
+if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient")) {
+    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Force | Out-Null
+}
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name EnableMulticast -Value 1 -Type DWORD -Force
 Write-Host "[ws01_misconfig] LLMNR/mDNS enabled"
 
