@@ -45,25 +45,27 @@ try {
     Write-Host "[srv01_services] Extracting $($expr.Name)..."
     Start-Process $expr.FullName -ArgumentList "/Q /X:$extract" -Wait
     Write-Host "[srv01_services] Installing SQL engine from extracted media..."
-    # /SQLSYSADMINACCOUNTS must name a principal SQL setup can resolve or the
-    # install aborts. SECSCOPE\SQLAdmins is created by dc01_objects.ps1 - if that
-    # hasn't propagated (or the group isn't resolvable yet), fall back to
-    # SECSCOPE\Domain Admins (always present) so the engine still installs. The
-    # SQLAdmins sysadmin role is re-asserted later via T-SQL in any case.
+    # /SQLSYSADMINACCOUNTS takes ONE account here. Multiple accounts must each be
+    # SEPARATELY quoted ("a" "b"); cramming two into one quoted string makes Setup
+    # treat it as a single invalid account and fail silently under /Q (this is why
+    # the earlier 'SQLAdmins Domain Admins' value left MSSQL$SQLEXPRESS uninstalled).
+    # Prefer SECSCOPE\SQLAdmins; fall back to SECSCOPE\Domain Admins (always present)
+    # if the group isn't resolvable yet.
     $sysadminAccounts = "SECSCOPE\Domain Admins"
     try {
         $null = (New-Object System.Security.Principal.NTAccount("SECSCOPE","SQLAdmins")).Translate([System.Security.Principal.SecurityIdentifier])
-        $sysadminAccounts = "SECSCOPE\SQLAdmins SECSCOPE\Domain Admins"
+        $sysadminAccounts = "SECSCOPE\SQLAdmins"
         Write-Host "[srv01_services] SQLAdmins group resolved; using it for SQL sysadmin"
     } catch {
         Write-Host "[srv01_services] WARNING: SECSCOPE\SQLAdmins not resolvable yet; installing with Domain Admins as sysadmin"
     }
-    Start-Process "$extract\SETUP.EXE" -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"$sysadminAccounts`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
+    $sqlProc = Start-Process "$extract\SETUP.EXE" -ArgumentList "/Q /ACTION=Install /FEATURES=SQLEngine /INSTANCENAME=SQLEXPRESS /SECURITYMODE=SQL /SAPWD=`"$adminPass`" /SQLSYSADMINACCOUNTS=`"$sysadminAccounts`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait -PassThru
+    Write-Host "[srv01_services] SQL SETUP.EXE exit code: $($sqlProc.ExitCode)"
     if (Get-Service "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue) {
         Write-Host "[srv01_services] SQL Server Express installed"
         $sqlInstalled = $true
     } else {
-        Write-Host "[srv01_services] WARNING: SQL setup ran but MSSQL`$SQLEXPRESS service not found"
+        Write-Host "[srv01_services] WARNING: SQL setup ran (exit $($sqlProc.ExitCode)) but MSSQL`$SQLEXPRESS not found. Check C:\Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log\Summary.txt"
     }
 } catch {
     Write-Host "[srv01_services] WARNING: SQL install failed: $_"
