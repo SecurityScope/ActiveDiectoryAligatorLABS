@@ -30,13 +30,14 @@ try {
     } else {
         Write-Host "[srv01_services] PSWA web app already present"
     }
-    # Authorization rule: allow Domain Users to connect to any computer with any
-    # session config (permissive, for the lab). Skip if an equivalent rule exists.
-    if (-not (Get-PswaAuthorizationRule -ErrorAction SilentlyContinue | Where-Object { $_.User -match "Domain Users" })) {
-        # -UserGroupName (not -UserName) because "Domain Users" is a group; -UserName
-        # throws ArgumentException for a group principal.
-        Add-PswaAuthorizationRule -UserGroupName "SECSCOPE\Domain Users" -ComputerName * -ConfigurationName * -ErrorAction Stop | Out-Null
-        Write-Host "[srv01_services] PSWA authorization rule added (SECSCOPE\Domain Users -> * -> *)"
+    # Authorization rule (permissive, for the lab): any user -> any computer -> any
+    # session config. Must use the wildcard '*' form, NOT a -UserGroupName rule:
+    # this provisioner runs as the LOCAL account srv01\vagrant, which cannot perform
+    # the AD query a group rule needs ("must be run by a user account with
+    # permissions to perform Active Directory queries"). '*' needs no AD lookup.
+    if (-not (Get-PswaAuthorizationRule -ErrorAction SilentlyContinue)) {
+        Add-PswaAuthorizationRule -UserName * -ComputerName * -ConfigurationName * -ErrorAction Stop | Out-Null
+        Write-Host "[srv01_services] PSWA authorization rule added (* -> * -> *)"
     } else {
         Write-Host "[srv01_services] PSWA authorization rule already present"
     }
