@@ -54,6 +54,18 @@ if (Get-ADOrganizationalUnit -Filter "Name -eq 'IT'" -SearchBase $domainDN -Sear
 $itDN = "OU=$itName,$domainDN"
 Write-Host "[objects] IT OU resolved to: $itDN"
 
+# Decide whether to process a given member's computer-object ACLs. SKIP_COMPUTERS
+# (set by the objects-base pass during the DC01 build) skips all of them. When
+# the per-member ACL pass runs for a single member, setup.py sets MEMBER_SCOPE to
+# that member's name so we only wait for / touch THAT computer instead of also
+# polling for the other, not-yet-built members.
+$memberScope = $env:MEMBER_SCOPE
+function Should-ProcessMember($name) {
+    if ($env:SKIP_COMPUTERS -eq "true") { return $false }
+    if ([string]::IsNullOrEmpty($memberScope)) { return $true }
+    return ($memberScope -eq $name)
+}
+
 function New-OU-IfMissing {
     param($Name, $Path)
     try {
@@ -248,9 +260,9 @@ try {
 # ACL: HelpDesk GenericWrite over WS01 computer object (enables RBCD)
 # ══════════════════════════════════════════════════════════════════════════
 
-if ($env:SKIP_COMPUTERS -eq "true") {
+if (-not (Should-ProcessMember "ws01")) {
 
-    Write-Host "[objects] SKIP_COMPUTERS=true -- skipping WS01 computer object ACLs"
+    Write-Host "[objects] Skipping WS01 computer ACLs (out of scope for this pass)"
 
 } else {
 
@@ -284,9 +296,9 @@ if ($ws01DN) {
 
 }
 
-if ($env:SKIP_COMPUTERS -eq "true") {
+if (-not (Should-ProcessMember "ws02")) {
 
-    Write-Host "[objects] SKIP_COMPUTERS=true -- skipping WS02 computer object ACLs"
+    Write-Host "[objects] Skipping WS02 computer ACLs (out of scope for this pass)"
 
 } else {
 
@@ -320,9 +332,9 @@ if ($ws02DN) {
 # ACL: Constrained delegation on SRV01 (to CIFS on WS01, no protocol transition)
 # ══════════════════════════════════════════════════════════════════════════
 
-if ($env:SKIP_COMPUTERS -eq "true") {
+if (-not (Should-ProcessMember "srv01")) {
 
-    Write-Host "[objects] SKIP_COMPUTERS=true -- skipping SRV01 computer object ACLs"
+    Write-Host "[objects] Skipping SRV01 computer ACLs (out of scope for this pass)"
 
 } else {
 

@@ -306,10 +306,12 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
 
 
 def vagrant(args, password=None, filter_winrm=True, capture=False, timeout=None,
-            check=False):
+            check=False, extra_env=None):
     env = {}
     if password is not None:
         env["DC_WINRM_PASSWORD"] = password
+    if extra_env:
+        env.update(extra_env)
     return run(["vagrant"] + args, env=env, capture=capture, check=check,
                timeout=timeout, filter_winrm=filter_winrm)
 
@@ -577,9 +579,10 @@ def reload_vm(vm, password=None):
     vagrant(["reload", vm, "--force"], password=password, filter_winrm=True)
 
 
-def provision(vm, name, password=None, timeout=None):
+def provision(vm, name, password=None, timeout=None, extra_env=None):
     rc, _ = vagrant(["provision", vm, "--provision-with", name],
-                    password=password, filter_winrm=True, timeout=timeout)
+                    password=password, filter_winrm=True, timeout=timeout,
+                    extra_env=extra_env)
     return rc
 
 
@@ -874,7 +877,10 @@ def _apply_member_acls(vm):
     applied now that the computer object exists. Idempotent."""
     log_info(f"Applying delegation/ACLs for {vm} on DC01...")
     with DC01_LOCK:
-        provision("dc01", "objects", password=ADMIN_PASS)
+        # Scope to just this member so the ACL pass doesn't wait on the other,
+        # not-yet-built members' computer objects.
+        provision("dc01", "objects", password=ADMIN_PASS,
+                  extra_env={"MEMBER_SCOPE": vm})
 
 
 BUILDERS = {

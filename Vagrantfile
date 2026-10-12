@@ -213,7 +213,12 @@ Vagrant.configure("2") do |config|
         "CHILD_DOMAIN" => CHILD_DOMAIN,
         "CHILD_UPPER"  => CHILD_UPPER,
         "ADMIN_PASS"   => ADMIN_PASS,
-        "DSRM_PASS"    => DSRM_PASS
+        "DSRM_PASS"    => DSRM_PASS,
+        # When set (by setup.py's per-member ACL pass) only that member's
+        # computer ACLs are applied, so building one member doesn't wait on the
+        # others. Empty (manual `vagrant provision dc01 --provision-with objects`)
+        # processes all members.
+        "MEMBER_SCOPE" => ENV['MEMBER_SCOPE']
       }
 
     vm.vm.provision "avupdate-gpo", type: "shell", run: "never",
