@@ -23,12 +23,33 @@ try {
         Write-Host "[srv01_services] PSWA feature already installed"
     }
     Import-Module PowerShellWebAccess -ErrorAction SilentlyContinue
-    # Create the /pswa IIS web app on HTTPS 443 with a self-signed cert (idempotent).
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    # Create the /pswa IIS web app on HTTPS 443 (idempotent).
     if (-not (Get-WebApplication -Name "pswa" -Site "Default Web Site" -ErrorAction SilentlyContinue)) {
         Install-PswaWebApplication -WebApplicationName "pswa" -UseTestCertificate -ErrorAction Stop
         Write-Host "[srv01_services] PSWA web app published at https://srv01.secscope.corp/pswa"
     } else {
         Write-Host "[srv01_services] PSWA web app already present"
+    }
+    # Install-PswaWebApplication -UseTestCertificate issues a SHA-1 cert, which
+    # modern browsers (and .NET/Schannel) REJECT - the TLS handshake fails before
+    # the page loads ("can't establish a secure connection"). Replace the 443
+    # binding with a SHA-256 self-signed cert so PSWA is actually reachable.
+    $bound = netsh http show sslcert ipport=0.0.0.0:443 2>$null | Select-String "Certificate Hash\s*:\s*([0-9a-fA-F]+)"
+    $needCert = $true
+    if ($bound) {
+        $th = ($bound.Matches[0].Groups[1].Value)
+        $cur = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $th }
+        if ($cur -and $cur.SignatureAlgorithm.FriendlyName -eq "sha256RSA") { $needCert = $false }
+    }
+    if ($needCert) {
+        $sha256 = New-SelfSignedCertificate -DnsName "srv01.secscope.corp","srv01","192.168.200.20" `
+            -CertStoreLocation Cert:\LocalMachine\My -HashAlgorithm SHA256 -KeyLength 2048 -NotAfter (Get-Date).AddYears(5)
+        Remove-Item "IIS:\SslBindings\0.0.0.0!443" -ErrorAction SilentlyContinue
+        New-Item "IIS:\SslBindings\0.0.0.0!443" -Value $sha256 | Out-Null
+        Write-Host "[srv01_services] Replaced PSWA test cert with a SHA-256 cert on 443"
+    } else {
+        Write-Host "[srv01_services] PSWA 443 cert already SHA-256"
     }
     # Authorization rule (permissive, for the lab): any user -> any computer -> any
     # session config. Must use the wildcard '*' form, NOT a -UserGroupName rule:
