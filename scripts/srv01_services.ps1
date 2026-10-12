@@ -33,7 +33,9 @@ try {
     # Authorization rule: allow Domain Users to connect to any computer with any
     # session config (permissive, for the lab). Skip if an equivalent rule exists.
     if (-not (Get-PswaAuthorizationRule -ErrorAction SilentlyContinue | Where-Object { $_.User -match "Domain Users" })) {
-        Add-PswaAuthorizationRule -UserName "SECSCOPE\Domain Users" -ComputerName * -ConfigurationName * -ErrorAction Stop | Out-Null
+        # -UserGroupName (not -UserName) because "Domain Users" is a group; -UserName
+        # throws ArgumentException for a group principal.
+        Add-PswaAuthorizationRule -UserGroupName "SECSCOPE\Domain Users" -ComputerName * -ConfigurationName * -ErrorAction Stop | Out-Null
         Write-Host "[srv01_services] PSWA authorization rule added (SECSCOPE\Domain Users -> * -> *)"
     } else {
         Write-Host "[srv01_services] PSWA authorization rule already present"
