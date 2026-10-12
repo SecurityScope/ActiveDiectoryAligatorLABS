@@ -38,24 +38,21 @@ $domainDN  = (Get-ADDomain).DistinguishedName
 
 Write-Host "[objects] Domain DN: $domainDN"
 
-# Self-heal: dc03_join.ps1 temporarily renames OU=IT to IT_TEMP while creating
-# the child domain, and dc03_postboot.ps1 renames it back. If that back-rename
-# didn't run yet (build order) or failed, restore it here (locally, as the DC's
-# own Administrator) so every "OU=IT,$domainDN" reference below resolves. This
-# makes a re-run of this script (e.g. the per-member ACL pass) build-order
-# independent instead of silently recreating an empty OU=IT alongside IT_TEMP.
-# -Filter (not -Identity) so a missing OU returns $null quietly instead of
-# throwing "Directory object not found" on a clean build where neither exists.
-$itTemp = Get-ADOrganizationalUnit -Filter "Name -eq 'IT_TEMP'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
-$itReal = Get-ADOrganizationalUnit -Filter "Name -eq 'IT'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
-if ($itTemp -and -not $itReal) {
-    try {
-        Rename-ADObject -Identity $itTemp.DistinguishedName -NewName "IT" -ErrorAction Stop
-        Write-Host "[objects] Restored OU IT_TEMP -> IT"
-    } catch {
-        Write-Host "[objects] WARNING: could not restore OU=IT from IT_TEMP ($_). IT objects may be under OU=IT_TEMP."
-    }
+# Resolve the IT OU name. Normally it's "IT", but once the child domain
+# it.secscope.corp exists, an OU literally named "IT" collides with the child
+# domain's name and AD refuses to create OR rename it (error 8305, "name already
+# in use"). dc03_join.ps1 therefore leaves the parent IT OU renamed to "IT_TEMP".
+# Detect whichever exists and use it EVERYWHERE below, so this script is correct
+# whether the child domain exists or not and never errors trying to make "OU=IT".
+# -Filter (not -Identity) returns $null quietly for a missing OU.
+$itName = "IT"
+if (Get-ADOrganizationalUnit -Filter "Name -eq 'IT'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue) {
+    $itName = "IT"
+} elseif (Get-ADOrganizationalUnit -Filter "Name -eq 'IT_TEMP'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue) {
+    $itName = "IT_TEMP"
 }
+$itDN = "OU=$itName,$domainDN"
+Write-Host "[objects] IT OU resolved to: $itDN"
 
 function New-OU-IfMissing {
     param($Name, $Path)
@@ -116,9 +113,9 @@ function Add-GroupMember-IfMissing {
 
 Write-Host "[objects] Creating OUs..."
 $ous = @(
-    @{Name="IT"; Path=$domainDN},
-    @{Name="Admins"; Path="OU=IT,$domainDN"},
-    @{Name="Workstations"; Path="OU=IT,$domainDN"},
+    @{Name=$itName; Path=$domainDN},
+    @{Name="Admins"; Path=$itDN},
+    @{Name="Workstations"; Path=$itDN},
     @{Name="HR"; Path=$domainDN},
     @{Name="HR-Workstations"; Path="OU=HR,$domainDN"},
     @{Name="Sales"; Path=$domainDN},
@@ -136,8 +133,8 @@ foreach ($ou in $ous) {
 # ══════════════════════════════════════════════════════════════════════════
 
 Write-Host "[objects] Creating users..."
-New-User-IfMissing -Name "anakin"    -Password "Vader2024!"     -Path "OU=Admins,OU=IT,$domainDN" -Description "IT Admin"
-New-User-IfMissing -Name "han"       -Password "Solo2024!"      -Path "OU=IT,$domainDN"          -Description "IT User"
+New-User-IfMissing -Name "anakin"    -Password "Vader2024!"     -Path "OU=Admins,$itDN" -Description "IT Admin"
+New-User-IfMissing -Name "han"       -Password "Solo2024!"      -Path $itDN          -Description "IT User"
 New-User-IfMissing -Name "leia"      -Password "Princess2024!"  -Path "OU=HR,$domainDN"          -Description "HR Manager"
 New-User-IfMissing -Name "luke"      -Password "password"       -Path "OU=Sales,$domainDN"       -Description "Sales user"
 New-User-IfMissing -Name "svc_sql"   -Password "SqlService123"  -Path "OU=ServiceAccounts,$domainDN" -Description "MSSQL service" -PasswordNeverExpires
@@ -151,11 +148,11 @@ New-User-IfMissing -Name "nopreauth" -Password "NoPreAuth123"   -Path "OU=Sales,
 # ══════════════════════════════════════════════════════════════════════════
 
 Write-Host "[objects] Creating groups..."
-New-Group-IfMissing -Name "IT-Team"                -Scope "Global" -Path "OU=IT,$domainDN"
+New-Group-IfMissing -Name "IT-Team"                -Scope "Global" -Path $itDN
 New-Group-IfMissing -Name "HR-Team"                -Scope "Global" -Path "OU=HR,$domainDN"
-New-Group-IfMissing -Name "HelpDesk"               -Scope "Global" -Path "OU=IT,$domainDN"
+New-Group-IfMissing -Name "HelpDesk"               -Scope "Global" -Path $itDN
 New-Group-IfMissing -Name "SQLAdmins"              -Scope "Global" -Path "OU=Servers,$domainDN"
-New-Group-IfMissing -Name "Backup-Operators-Custom"-Scope "Global" -Path "OU=IT,$domainDN"
+New-Group-IfMissing -Name "Backup-Operators-Custom"-Scope "Global" -Path $itDN
 
 # ══════════════════════════════════════════════════════════════════════════
 # Group memberships
@@ -381,7 +378,7 @@ try {
 # ══════════════════════════════════════════════════════════════════════════
 
 Write-Host "[objects] Configuring LAPS (schema, self-permission, read grant, GPO)..."
-$workstationsOU = "OU=Workstations,OU=IT,$domainDN"
+$workstationsOU = "OU=Workstations,$itDN"
 try {
     Import-Module AdmPwd.PS -ErrorAction Stop
 
@@ -511,7 +508,7 @@ try {
 }
 
 Write-Host "[objects] Creating Exchange users and machine..."
-New-User-IfMissing -Name "exch_admin" -Password "Exchange2024!" -Path "OU=Admins,OU=IT,$domainDN" -Description "Exchange administrator" -PasswordNeverExpires
+New-User-IfMissing -Name "exch_admin" -Password "Exchange2024!" -Path "OU=Admins,$itDN" -Description "Exchange administrator" -PasswordNeverExpires
 Add-GroupMember-IfMissing -Group "Organization Management" -Member "exch_admin"
 
 # Create EXCH01 computer account (simulated Exchange server)
