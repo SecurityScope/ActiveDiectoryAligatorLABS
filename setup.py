@@ -405,6 +405,19 @@ def _winrm_role(vm):
     return None
 
 
+def _member_name_ok(vm):
+    """True if the guest's computer name matches the intended name (e.g. SRV01).
+    Guards against a join that succeeded but left the box as VAGRANT-BUILD because
+    the rename failed - which domain role alone cannot detect."""
+    want = vm.upper()
+    for pw in ("vagrant", ADMIN_PASS):
+        rc, out = vagrant_winrm(
+            vm, "(Get-CimInstance Win32_ComputerSystem).Name", password=pw, timeout=60)
+        if out and out.strip():
+            return want in out.upper()
+    return False
+
+
 def is_provisioned(vm):
     """Live check: has this VM completed its build pipeline?"""
     if not vm_running(vm):
@@ -425,9 +438,11 @@ def is_provisioned(vm):
     if vm in ("dc02", "dc03"):
         role = _winrm_role(vm)
         return role is not None and role >= 4
-    # member servers/workstations: role 1 (workstation) or 3 (member server)
+    # member servers/workstations: must be domain-joined (role 1 workstation / 3
+    # member server) AND carry the correct name - a box joined as VAGRANT-BUILD
+    # (rename failed) is NOT a finished build and must not satisfy the guard.
     role = _winrm_role(vm)
-    return role in (1, 3)
+    return role in (1, 3) and _member_name_ok(vm)
 
 
 def probe_status(vm):
@@ -828,14 +843,22 @@ def _member_join(vm):
     for attempt in (1, 2, 3):
         reload_vm(vm)
         role = _winrm_role(vm)
-        if role in (1, 3):
+        name_ok = _member_name_ok(vm)
+        if role in (1, 3) and name_ok:
             ok = True
             break
-        log_warn(f"{vm} not domain-joined after reload {attempt}/3 (role={role}); retrying...")
+        # Joined but MIS-NAMED (e.g. still VAGRANT-BUILD because the rename hit
+        # 'The directory service is busy'), or not joined yet. Re-run the
+        # idempotent join provisioner - it detects the existing membership and
+        # resumes at the rename - then reload again.
+        log_warn(f"{vm} not fully joined after reload {attempt}/3 "
+                 f"(role={role}, name_ok={name_ok}); re-running join...")
+        provision(vm, "join")
         time.sleep(10)
     if not ok:
-        raise LabError(f"{vm} did not reach a domain-joined role")
-    log_ok(f"{vm} joined {DOMAIN}")
+        raise LabError(f"{vm} did not reach a domain-joined role with the correct name "
+                       f"(expected {vm.upper()})")
+    log_ok(f"{vm} joined {DOMAIN} as {vm.upper()}")
 
 
 def build_srv01():

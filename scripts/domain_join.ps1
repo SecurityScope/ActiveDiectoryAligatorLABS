@@ -142,58 +142,83 @@ if ($env:VM_OU) {
     }
 }
 
-$joined = $false
-for ($i = 1; $i -le 5; $i++) {
-    Write-Host "[$logPrefix] Attempt $i/5..."
-    try {
-        $addParams = @{
-            DomainName = $domain
-            Credential = $cred
-            Force      = $true
-            ErrorAction = "Stop"
+# Is the machine already in the target domain? A previous attempt may have joined
+# it (as VAGRANT-BUILD) but failed the rename, leaving it joined-but-misnamed - or
+# this is an idempotent re-run. In that case DON'T call Add-Computer again (it
+# fails "already in that domain"); go straight to the rename step.
+$cs = Get-CimInstance Win32_ComputerSystem
+$alreadyJoined = $cs.PartOfDomain -and ($cs.Domain -eq $domain)
+
+if ($alreadyJoined) {
+    Write-Host "[$logPrefix] Already joined to $domain (computer name '$($env:COMPUTERNAME)'); ensuring rename only"
+} else {
+    # Join WITHOUT -NewName. Combining join + rename in one Add-Computer call is
+    # what hit 'The directory service is busy' DURING the rename and left the box
+    # joined as VAGRANT-BUILD with no $vmName computer object. Join first; rename
+    # as a separate, retryable step below.
+    $joined = $false
+    for ($i = 1; $i -le 5; $i++) {
+        Write-Host "[$logPrefix] Join attempt $i/5..."
+        try {
+            $addParams = @{
+                DomainName  = $domain
+                Credential  = $cred
+                Force       = $true
+                ErrorAction = "Stop"
+            }
+            if ($ouPath) { $addParams["OUPath"] = $ouPath }
+            Add-Computer @addParams
+            Write-Host "[$logPrefix] Joined domain"
+            $joined = $true
+            break
+        } catch {
+            $msg = $_.Exception.Message
+            if ($msg -match "already in that domain|already a member of") {
+                Write-Host "[$logPrefix] Already a member (joined on a prior attempt); proceeding to rename"
+                $joined = $true
+                break
+            }
+            if ($msg -match "already exists") {
+                Remove-ADComputer -Identity $vmName -Credential $cred -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Host "[$logPrefix] Removed stale AD object, retrying..."
+            }
+            Write-Host "[$logPrefix] Join attempt $i/5 failed: $msg"
+            Start-Sleep 5
         }
-        if ($ouPath) {
-            $addParams["OUPath"] = $ouPath
-        }
-        if ($env:COMPUTERNAME -ne $vmName) {
-            $addParams["NewName"] = $vmName
-        }
-        Add-Computer @addParams
-        Write-Host "[$logPrefix] Joined domain"
-        $joined = $true
-        break
-    } catch {
-        if ($_.Exception.Message -match "already exists") {
-            Remove-ADComputer -Identity $vmName -Credential $cred -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "[$logPrefix] Removed stale AD object, retrying..."
-        }
-        Write-Host "[$logPrefix] Attempt $i/5 failed: $_"
-        Start-Sleep 5
     }
-}
-
-if (-not $joined) {
-    Write-Host "[$logPrefix] ERROR: Domain join failed after 5 attempts"
-    exit 1
-}
-
-# Add-Computer's -NewName has been observed to join the domain successfully
-# while silently not staging the rename (no pending ComputerName in the
-# registry, even though HasSucceeded would report true). Verify the rename
-# actually staged and fall back to an explicit Rename-Computer if not -
-# this is required, not optional, before the "join-reload" reboot.
-$pendingName = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName
-if ($pendingName -ne $vmName) {
-    Write-Host "[$logPrefix] Rename did not stage during join (pending name: $pendingName) - retrying via Rename-Computer..."
-    try {
-        Rename-Computer -NewName $vmName -DomainCredential $cred -Force -ErrorAction Stop
-        Write-Host "[$logPrefix] Rename-Computer succeeded"
-    } catch {
-        Write-Host "[$logPrefix] ERROR: Rename-Computer failed: $_"
+    if (-not $joined) {
+        Write-Host "[$logPrefix] ERROR: Domain join failed after 5 attempts"
         exit 1
     }
+}
+
+# Ensure the computer is named $vmName. SEPARATE, RETRYABLE step: the rename
+# contacts AD and can transiently fail with 'The directory service is busy' -
+# which is exactly what left the earlier build joined as VAGRANT-BUILD. Skip if
+# the name is already correct or a rename is already staged (pending reboot).
+$pendingName = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName
+if ($env:COMPUTERNAME -eq $vmName -or $pendingName -eq $vmName) {
+    Write-Host "[$logPrefix] Computer name already '$vmName' (or rename staged)"
 } else {
-    Write-Host "[$logPrefix] Rename to $vmName staged correctly"
+    $renamed = $false
+    for ($r = 1; $r -le 6; $r++) {
+        try {
+            Rename-Computer -NewName $vmName -DomainCredential $cred -Force -ErrorAction Stop
+            Write-Host "[$logPrefix] Rename to '$vmName' succeeded (attempt $r)"
+            $renamed = $true
+            break
+        } catch {
+            if ($_.Exception.Message -match "already exists") {
+                Remove-ADComputer -Identity $vmName -Credential $cred -Confirm:$false -ErrorAction SilentlyContinue
+            }
+            Write-Host "[$logPrefix] Rename attempt $r/6 failed (e.g. 'directory service is busy'): $_"
+            Start-Sleep 10
+        }
+    }
+    if (-not $renamed) {
+        Write-Host "[$logPrefix] ERROR: could not rename computer to '$vmName' after 6 attempts"
+        exit 1
+    }
 }
 
 Write-Host "[$logPrefix] Done. Vagrant reload provisioner will reboot to complete domain join."
