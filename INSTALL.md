@@ -272,6 +272,23 @@ you exactly what to build first. Check state any time with:
 python3 setup.py status
 ```
 
+**Dependency reference** (a machine builds only once its dependencies are running
+and fully provisioned):
+
+| Machine | Requires first | Notes |
+|---------|----------------|-------|
+| DC01 | — | Forest root; build first. |
+| DC02 | DC01 | Replica DC in `secscope.corp`. |
+| DC03 | DC01 **and** DC02 | Child domain `it.secscope.corp` (needs a converged replication partner). |
+| SRV01 | DC01 | Member: MSSQL + IIS + ADCS. |
+| WS01 | DC01 | Workstation. |
+| WS02 | DC01 | Workstation. |
+| LIN01 | DC01 | Linux (SSSD) member. |
+
+Recommended order: **dc01 → dc02 → dc03 → srv01, ws01, ws02, lin01**. The members
+only depend on DC01 and are independent of each other. See the **Build
+Dependencies** section in `README.md` for the full dependency diagram.
+
 ### Build Options
 
 ```bash

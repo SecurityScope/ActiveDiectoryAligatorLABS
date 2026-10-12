@@ -58,6 +58,56 @@ python3 setup.py seal all            # single-home each VM on 192.168.200.x
 
 > **Windows evaluation period:** Both Windows boxes are built from evaluation ISOs valid for 180 days. After expiration, Windows will shut down every hour. Check remaining time: `slmgr /dli`. Rearm (up to 3 times): `slmgr /rearm`.
 
+## Build Dependencies
+
+Each machine can only be built once the machines it depends on are **running and
+fully provisioned**. `setup.py` enforces this: if a dependency is missing, the
+build aborts with an explicit message telling you what to build first (it never
+auto-builds dependencies for you). Boxes must be registered first (`build-boxes`).
+
+| Machine | Requires (must be built first) | Why |
+|---------|--------------------------------|-----|
+| **DC01** | *(nothing)* | Forest root DC — build this first. |
+| **DC02** | **DC01** | Replica DC joins the existing `secscope.corp` domain on DC01. |
+| **DC03** | **DC01 + DC02** | Child domain `it.secscope.corp` needs the forest root **and** a converged replication partner (DC02) before `Install-ADDSDomain`. |
+| **SRV01** | **DC01** | Member server joins the domain; its ADCS/MSSQL/ACL config needs DC01's AD objects. |
+| **WS01** | **DC01** | Workstation joins the domain. |
+| **WS02** | **DC01** | Workstation joins the domain. |
+| **LIN01** | **DC01** | Linux member joins via SSSD/realmd against DC01. |
+
+```
+          ┌───────┐
+          │ DC01  │  (forest root — build first)
+          └───┬───┘
+     ┌────────┼───────────────┬────────┬────────┬────────┐
+     ▼        ▼               ▼        ▼        ▼        ▼
+  ┌──────┐  ┌──────┐       ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+  │ DC02 │  │SRV01 │       │ WS01 │ │ WS02 │ │LIN01 │ │ ...  │
+  └──┬───┘  └──────┘       └──────┘ └──────┘ └──────┘ └──────┘
+     ▼
+  ┌──────┐
+  │ DC03 │  (also needs DC01)
+  └──────┘
+```
+
+**Recommended order:** `dc01` → `dc02` → `dc03` → `srv01`, `ws01`, `ws02`, `lin01`
+(the members are independent of each other and only need DC01, so they can be
+built in any order — or overlapped with `build all --parallel`).
+
+```bash
+# Dependency-ordered examples
+python3 setup.py build dc01                 # no deps
+python3 setup.py build dc02                 # needs dc01 ready
+python3 setup.py build dc03                 # needs dc01 AND dc02 ready
+python3 setup.py build srv01 ws01 ws02      # each only needs dc01
+python3 setup.py build all                  # everything, auto-ordered
+python3 setup.py build all --parallel       # overlap independent members (deps stay serialized)
+```
+
+> Members (`srv01`/`ws01`/`ws02`/`lin01`) require only **DC01**, but for a full
+> forest you normally build the DCs first (`dc01` → `dc02` → `dc03`) so the
+> cross-domain objects and trust exist before members and their ACLs are applied.
+
 ## Setup Script Options
 
 `setup.py` builds **one machine at a time** with hard dependency enforcement and
