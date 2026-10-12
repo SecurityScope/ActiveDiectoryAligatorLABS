@@ -40,6 +40,13 @@ if ($nic2) {
     $otherNics = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceIndex -ne $ifIndex }
     foreach ($o in $otherNics) {
         Set-NetIPInterface -InterfaceIndex $o.InterfaceIndex -InterfaceMetric 200 -ErrorAction SilentlyContinue
+        # Point the NAT adapter's DNS at DC01 too. Leaving it on the VirtualBox
+        # host-resolver (--natdnshostresolver1 on) means the DC Locator
+        # (DsGetDcName) round-robins onto it and gets NXDOMAIN for the _msdcs SRV
+        # records, so the domain join fails "the specified domain could not be
+        # contacted" even though nslookup to DC01 works. DC01 forwards to 8.8.8.8
+        # so internet name resolution still works through it.
+        Set-DnsClientServerAddress -InterfaceIndex $o.InterfaceIndex -ServerAddresses $dc01IP -ErrorAction SilentlyContinue
         Set-DnsClient -InterfaceIndex $o.InterfaceIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue
         $guid = (Get-NetAdapter -InterfaceIndex $o.InterfaceIndex).InterfaceGuid
         $ifKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
@@ -60,18 +67,26 @@ if ($nic2) {
 }
 
 Write-Host "[$logPrefix] Waiting for DC01 to be reachable..."
+# Test an actual TCP port (SMB/445), NOT ICMP: VirtualBox NAT networks don't
+# reliably pass ping, so Test-Connection throws 'Generic failure' even when the
+# DC is fully reachable over TCP. 445 is what the join needs anyway.
 $reachable = $false
-for ($i = 1; $i -le 10; $i++) {
-    if (Test-Connection $dc01IP -Count 1 -Quiet) {
-        $reachable = $true
-        Write-Host "[$logPrefix] DC01 reachable"
-        break
-    }
-    Write-Host "[$logPrefix] Attempt $i/10, waiting..."
+for ($i = 1; $i -le 12; $i++) {
+    try {
+        $t = New-Object System.Net.Sockets.TcpClient
+        $iar = $t.BeginConnect($dc01IP, 445, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne(3000) -and $t.Connected) {
+            $reachable = $true; $t.Close()
+            Write-Host "[$logPrefix] DC01 reachable (TCP 445)"
+            break
+        }
+        $t.Close()
+    } catch { }
+    Write-Host "[$logPrefix] Attempt $i/12, waiting..."
     Start-Sleep 5
 }
 if (-not $reachable) {
-    Write-Host "[$logPrefix] ERROR: DC01 not reachable after 50s"
+    Write-Host "[$logPrefix] ERROR: DC01 not reachable on TCP 445 after 60s"
     exit 1
 }
 
@@ -108,6 +123,27 @@ for ($i = 1; $i -le 6; $i++) {
 if (-not $dnsOk) {
     Write-Host "[$logPrefix] ERROR: Cannot resolve $domain (SRV) via $dc01IP"
     exit 1
+}
+
+# nslookup proves DNS resolves, but Add-Computer uses the DC LOCATOR
+# (DsGetDcName), which queries the DNS client across all adapters. Confirm the
+# locator itself can find a DC (and warm its cache) before joining - this is
+# what actually fails with "the specified domain could not be contacted".
+Write-Host "[$logPrefix] Verifying DC Locator can find a DC for $domain..."
+$dcOk = $false
+for ($i = 1; $i -le 10; $i++) {
+    Clear-DnsClientCache
+    $dc = nltest "/dsgetdc:$domain" 2>&1
+    if ($dc -match "DC:\s*\\\\" -and $dc -notmatch "ERROR") {
+        Write-Host "[$logPrefix] DC Locator OK: $(( $dc | Select-String 'DC:' | Select-Object -First 1).ToString().Trim())"
+        $dcOk = $true
+        break
+    }
+    Write-Host "[$logPrefix] DC Locator attempt $i/10 (not found yet)..."
+    Start-Sleep 5
+}
+if (-not $dcOk) {
+    Write-Host "[$logPrefix] WARNING: DC Locator could not confirm a DC; attempting join anyway"
 }
 
 Write-Host "[$logPrefix] Joining domain $domain..."
