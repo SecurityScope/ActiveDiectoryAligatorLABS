@@ -143,9 +143,21 @@ chmod 644 /opt/.hidden_key
 
 echo "[lin01] Planting credentials in bash history for labuser..."
 mkdir -p /home/labuser/.ssh
-echo "sshpass -p 'Solo2024!' ssh han@192.168.200.30" > /home/labuser/.bash_history
-echo "mysql -h 192.168.200.20 -u svc_sql -pSqlService123 secscope_db" >> /home/labuser/.bash_history
+# Target real/plausible hosts: han over SSH to lin01 (a Linux SSH host), and
+# svc_sql to the MSSQL instance on SRV01 (impacket's mssqlclient, since SRV01
+# runs MSSQL not MySQL). The value is the leaked credentials either way.
+echo "sshpass -p 'Solo2024!' ssh han@lin01.$DOMAIN_LOWER" > /home/labuser/.bash_history
+echo "impacket-mssqlclient svc_sql:SqlService123@192.168.200.20 -windows-auth" >> /home/labuser/.bash_history
+echo "kinit han@$DOMAIN_UPPER" >> /home/labuser/.bash_history
 chown labuser:labuser /home/labuser/.bash_history
+
+echo "[lin01] Planting known_hosts (lateral-target hint)..."
+cat > /home/labuser/.ssh/known_hosts <<EOF
+lin01.$DOMAIN_LOWER,$LIN01_IP ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholderKeyForLabKnownHostsEntryOnly000000000
+EOF
+chown -R labuser:labuser /home/labuser/.ssh
+chmod 700 /home/labuser/.ssh
+chmod 644 /home/labuser/.ssh/known_hosts
 
 echo "[lin01] Creating Kerberos keytab (for keytab enumeration exercise)..."
 printf 'addent -password -p Administrator@%s -k 1 -e rc4-hmac\n%s\nwkt /etc/krb5.keytab\nquit\n' "$DOMAIN_UPPER" "$ADMIN_PASS" | timeout 10 ktutil 2>/dev/null || true
