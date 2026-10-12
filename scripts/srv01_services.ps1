@@ -21,13 +21,24 @@ try {
     # does NOT reliably create an engine instance. Use it to DOWNLOAD the full
     # media package, extract the self-extracting SQLEXPR archive, then run its
     # real setup.exe with the unattended parameters.
-    $sqlUrl   = "https://download.microsoft.com/download/5/1/4/5145fe04-4d30-4b85-b0d1-39533663a2f1/SQL2022-SSEI-Expr.exe"
+    # Use Microsoft's permanent fwlink redirect, NOT a hardcoded download.microsoft.com
+    # path (those rotate and 404 - the old direct URL returned a 404 HTML page that
+    # got logged as the "SQL install failed" error). Offline-first: if a bundled
+    # SQL2022-SSEI-Expr.exe is dropped in the repo root it is used instead.
+    $sqlUrl   = "https://go.microsoft.com/fwlink/?linkid=2216019"
     $ssei     = "C:\Temp\SQL2022-SSEI-Expr.exe"
+    if (Test-Path "C:\vagrant\SQL2022-SSEI-Expr.exe") {
+        New-Item -ItemType Directory -Force -Path C:\Temp | Out-Null
+        Copy-Item "C:\vagrant\SQL2022-SSEI-Expr.exe" $ssei -Force
+        Write-Host "[srv01_services] Using bundled SQL installer from C:\vagrant"
+    }
     $mediaDir = "C:\SQLMedia"
     $extract  = "C:\SQLExtract"
     New-Item -ItemType Directory -Force -Path C:\Temp | Out-Null
-    Invoke-WebRequest -Uri $sqlUrl -OutFile $ssei -TimeoutSec 300 -ErrorAction Stop
-    Write-Host "[srv01_services] SSEI downloaded, fetching full media (this can take a few minutes)..."
+    if (-not (Test-Path $ssei)) {
+        Invoke-WebRequest -Uri $sqlUrl -OutFile $ssei -TimeoutSec 300 -ErrorAction Stop
+    }
+    Write-Host "[srv01_services] SSEI ready, fetching full media (this can take a few minutes)..."
     Start-Process $ssei -ArgumentList "/ACTION=Download /MEDIAPATH=$mediaDir /MEDIATYPE=Core /QUIET" -Wait
     $expr = Get-ChildItem $mediaDir -Filter "SQLEXPR*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $expr) { throw "Full media download failed; no SQLEXPR*.exe in $mediaDir" }

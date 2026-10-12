@@ -257,11 +257,11 @@ if ($env:SKIP_COMPUTERS -eq "true") {
 Write-Host "[objects] Waiting for WS01 computer object..."
 $ws01DN = $null
 $attempts = 0
-while (-not $ws01DN -and $attempts -lt 24) {
+while (-not $ws01DN -and $attempts -lt 6) {
     Start-Sleep 10
     $attempts++
     try { $ws01DN = (Get-ADComputer WS01).DistinguishedName } catch {}
-    Write-Host "[objects] Waiting for WS01$... attempt $attempts/24"
+    Write-Host "[objects] Waiting for WS01$... attempt $attempts/6"
 }
 if ($ws01DN) {
     try {
@@ -297,11 +297,11 @@ if ($env:SKIP_COMPUTERS -eq "true") {
 Write-Host "[objects] Waiting for WS02 computer object..."
 $ws02DN = $null
 $attempts = 0
-while (-not $ws02DN -and $attempts -lt 24) {
+while (-not $ws02DN -and $attempts -lt 6) {
     Start-Sleep 10
     $attempts++
     try { $ws02DN = (Get-ADComputer WS02).DistinguishedName } catch {}
-    Write-Host "[objects] Waiting for WS02$... attempt $attempts/24"
+    Write-Host "[objects] Waiting for WS02$... attempt $attempts/6"
 }
 if ($ws02DN) {
     try {
@@ -329,11 +329,11 @@ if ($env:SKIP_COMPUTERS -eq "true") {
 Write-Host "[objects] Waiting for SRV01 computer object..."
 $srv01DN = $null
 $attempts = 0
-while (-not $srv01DN -and $attempts -lt 24) {
+while (-not $srv01DN -and $attempts -lt 6) {
     Start-Sleep 10
     $attempts++
     try { $srv01DN = (Get-ADComputer SRV01).DistinguishedName } catch {}
-    Write-Host "[objects] Waiting for SRV01$... attempt $attempts/24"
+    Write-Host "[objects] Waiting for SRV01$... attempt $attempts/6"
 }
 if ($srv01DN) {
     try {

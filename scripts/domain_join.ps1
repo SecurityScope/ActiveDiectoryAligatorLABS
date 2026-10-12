@@ -122,10 +122,16 @@ $cred = New-Object PSCredential("Administrator@$domain", $password)
 $ouPath = $null
 if ($env:VM_OU) {
     $domainDN = ($domain.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+    # Candidates: the literal VM_OU, and (for IT) the IT_TEMP variant the child
+    # domain forces. Verify via ADSI/DirectoryEntry, NOT Get-ADObject - members
+    # don't have the ActiveDirectory module at join time (RSAT installs later),
+    # so a Get-ADObject check always threw and we fell back to CN=Computers,
+    # breaking OU placement (and with it the LAPS GPO/ACL on the Workstations OU).
     $candidates = @("$($env:VM_OU),$domainDN", "$($env:VM_OU -replace 'OU=IT','OU=IT_TEMP'),$domainDN")
     foreach ($cand in $candidates) {
         try {
-            $null = Get-ADObject -Identity $cand -Server $dc01IP -Credential $cred -ErrorAction Stop
+            $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dc01IP/$cand", "Administrator@$domain", $adminPass)
+            $null = $de.Guid   # forces the bind; throws if the OU doesn't exist
             $ouPath = $cand
             Write-Host "[$logPrefix] Target OU resolved: $ouPath"
             break
