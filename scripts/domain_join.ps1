@@ -167,10 +167,17 @@ if ($env:VM_OU) {
     foreach ($cand in $candidates) {
         try {
             $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dc01IP/$cand", "Administrator@$domain", $adminPass)
-            $null = $de.Guid   # forces the bind; throws if the OU doesn't exist
-            $ouPath = $cand
-            Write-Host "[$logPrefix] Target OU resolved: $ouPath"
-            break
+            # RefreshCache() forces a real server bind and THROWS if the OU does
+            # not exist. (.Guid does NOT reliably validate - it can return a GUID
+            # from the ADsPath without contacting the server, so it false-matched
+            # a non-existent OU=IT and Add-Computer -OUPath then failed "the system
+            # cannot find the file specified".)
+            $de.RefreshCache()
+            if ($de.Properties["distinguishedName"].Value) {
+                $ouPath = $cand
+                Write-Host "[$logPrefix] Target OU resolved: $ouPath"
+                break
+            }
         } catch { }
     }
     if (-not $ouPath) {
@@ -217,6 +224,13 @@ if ($alreadyJoined) {
             if ($msg -match "already exists") {
                 Remove-ADComputer -Identity $vmName -Credential $cred -Confirm:$false -ErrorAction SilentlyContinue
                 Write-Host "[$logPrefix] Removed stale AD object, retrying..."
+            }
+            # "The system cannot find the file specified" here almost always means
+            # the -OUPath OU doesn't exist. Drop OUPath and fall back to the default
+            # Computers container rather than failing the whole build.
+            if ($ouPath -and $msg -match "cannot find the file specified") {
+                Write-Host "[$logPrefix] OUPath '$ouPath' rejected; falling back to default container"
+                $ouPath = $null
             }
             Write-Host "[$logPrefix] Join attempt $i/5 failed: $msg"
             Start-Sleep 5
