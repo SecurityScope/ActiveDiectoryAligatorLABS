@@ -523,27 +523,32 @@ Write-Host "[objects] Creating Exchange users and machine..."
 New-User-IfMissing -Name "exch_admin" -Password "Exchange2024!" -Path "OU=Admins,$itDN" -Description "Exchange administrator" -PasswordNeverExpires
 Add-GroupMember-IfMissing -Group "Organization Management" -Member "exch_admin"
 
-# Create EXCH01 computer account (simulated Exchange server)
-try {
-    $exchExists = Get-ADComputer "EXCH01" -ErrorAction SilentlyContinue
-    if (-not $exchExists) {
+# Create EXCH01 computer account (simulated Exchange server).
+# Use -Filter, NOT -Identity: Get-ADComputer -Identity throws a terminating
+# ADIdentityNotFoundException on a missing object even with
+# -ErrorAction SilentlyContinue, which jumped to the catch and meant
+# New-ADComputer never ran - so EXCH01 was never actually created and EXCH01$
+# never got added to Exchange Trusted Subsystem. -Filter returns $null quietly.
+$exchExists = Get-ADComputer -Filter "Name -eq 'EXCH01'" -ErrorAction SilentlyContinue
+if (-not $exchExists) {
+    try {
         New-ADComputer -Name "EXCH01" -SamAccountName "EXCH01" -Path "OU=Servers,$domainDN" -Enabled $true
         Write-Host "[objects] Created computer EXCH01"
+    } catch {
+        Write-Host "[objects] EXCH01 create failed: $_"
     }
-} catch {
-    Write-Host "[objects] EXCH01 computer may already exist"
+} else {
+    Write-Host "[objects] EXCH01 computer already exists"
 }
 Write-Host "[objects] Waiting for EXCH01$ to commit..."
 $exch01Ready = $false
 for ($i = 1; $i -le 5; $i++) {
     Start-Sleep 2
-    try {
-        $null = Get-ADComputer "EXCH01" -ErrorAction Stop
+    if (Get-ADComputer -Filter "Name -eq 'EXCH01'" -ErrorAction SilentlyContinue) {
         $exch01Ready = $true
         break
-    } catch {
-        Write-Host "[objects] EXCH01$ not yet visible, attempt $i/5..."
     }
+    Write-Host "[objects] EXCH01$ not yet visible, attempt $i/5..."
 }
 if ($exch01Ready) {
     Add-GroupMember-IfMissing -Group "Exchange Trusted Subsystem" -Member "EXCH01$"
