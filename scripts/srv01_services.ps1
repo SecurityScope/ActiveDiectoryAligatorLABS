@@ -9,6 +9,39 @@ Write-Host "[srv01_services] Installing IIS..."
 Install-WindowsFeature -Name Web-Server, Web-Mgmt-Tools -IncludeManagementTools
 Write-Host "[srv01_services] IIS installed"
 
+# ── PowerShell Web Access (PSWA) ──────────────────────────────────────────
+# The lab material (09_Lateral_Movement.md) references PSWA on SRV01 at the
+# /pswa endpoint (HTTPS 443). Install + configure the gateway with a self-signed
+# cert and a permissive authorization rule so Domain Users can reach it. PSWA is
+# deprecated but still installable on Server 2022. Idempotent + non-fatal.
+Write-Host "[srv01_services] Installing PowerShell Web Access (PSWA)..."
+try {
+    if ((Get-WindowsFeature WindowsPowerShellWebAccess).InstallState -ne "Installed") {
+        Install-WindowsFeature -Name WindowsPowerShellWebAccess -IncludeManagementTools -ErrorAction Stop | Out-Null
+        Write-Host "[srv01_services] PSWA feature installed"
+    } else {
+        Write-Host "[srv01_services] PSWA feature already installed"
+    }
+    Import-Module PowerShellWebAccess -ErrorAction SilentlyContinue
+    # Create the /pswa IIS web app on HTTPS 443 with a self-signed cert (idempotent).
+    if (-not (Get-WebApplication -Name "pswa" -Site "Default Web Site" -ErrorAction SilentlyContinue)) {
+        Install-PswaWebApplication -WebApplicationName "pswa" -UseTestCertificate -ErrorAction Stop
+        Write-Host "[srv01_services] PSWA web app published at https://srv01.secscope.corp/pswa"
+    } else {
+        Write-Host "[srv01_services] PSWA web app already present"
+    }
+    # Authorization rule: allow Domain Users to connect to any computer with any
+    # session config (permissive, for the lab). Skip if an equivalent rule exists.
+    if (-not (Get-PswaAuthorizationRule -ErrorAction SilentlyContinue | Where-Object { $_.User -match "Domain Users" })) {
+        Add-PswaAuthorizationRule -UserName "SECSCOPE\Domain Users" -ComputerName * -ConfigurationName * -ErrorAction Stop | Out-Null
+        Write-Host "[srv01_services] PSWA authorization rule added (SECSCOPE\Domain Users -> * -> *)"
+    } else {
+        Write-Host "[srv01_services] PSWA authorization rule already present"
+    }
+} catch {
+    Write-Host "[srv01_services] WARNING: PSWA setup incomplete: $_"
+}
+
 Write-Host "[srv01_services] Downloading SQL Server Express..."
 $sqlInstalled = $false
 if (Get-Service "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue) {
