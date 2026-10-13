@@ -95,6 +95,10 @@ build {
   sources = ["source.virtualbox-iso.debian-bookworm"]
 
   provisioner "shell" {
+    # Packer's shell provisioner runs as the SSH user (vagrant); the GA script
+    # does apt-get/mount which need root, so run it via sudo (password piped to
+    # sudo -S). Without this it failed with apt exit status 100.
+    execute_command = "echo 'vagrant' | {{ .Vars }} sudo -S -E bash '{{ .Path }}'"
     scripts = [
       "packer/scripts/install_vboxga_linux.sh"
     ]
