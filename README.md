@@ -50,6 +50,8 @@ python3 setup.py build srv01 ws01 ws02 lin01   # members (require dc01)
 python3 setup.py build all           # add --parallel to overlap members
 
 # 4. (optional, when finished) lock the lab down
+python3 setup.py finalize all        # harden + fix NAT-leak DNS + seal (one step)
+#   or run the individual steps:
 python3 setup.py harden all          # remove vagrant creds (severs Vagrant mgmt)
 python3 setup.py seal all            # single-home each VM on 192.168.200.x
 ```
@@ -117,10 +119,11 @@ reference.
 
 ```bash
 # Build boxes
-python3 setup.py build-boxes                 # Build the two Windows boxes (default)
+python3 setup.py build-boxes                 # Build all 3 boxes (Win2022 + Win10 + Debian)
 python3 setup.py build-boxes --server-only   # Server 2022 only
 python3 setup.py build-boxes --workstation-only  # Windows 10 only
-python3 setup.py build-boxes --with-debian   # also build the (optional) Debian box
+python3 setup.py build-boxes --debian-only   # Debian box only (lin01 needs it)
+python3 setup.py build-boxes --skip-debian   # both Windows boxes, skip Debian
 
 # Build machines (dependency-ordered, one-at-a-time)
 python3 setup.py build dc01                  # single machine
@@ -142,6 +145,7 @@ python3 setup.py build dc01 --debug          # show suppressed WinRM errors
 
 # Management
 python3 setup.py status                      # live table of all VM states
+python3 setup.py finalize <vm>|all           # harden + fix NAT-leak DNS + seal
 python3 setup.py harden <vm>|all             # remove vagrant creds (post-build)
 python3 setup.py seal <vm>|all               # remove NAT nic1 (single-homed)
 python3 setup.py unseal <vm>|all             # restore NAT nic1 (re-enable mgmt)
@@ -322,10 +326,17 @@ vagrant provision lin01 --provision-with setup
 
 ## After Running Hardening
 
-Once the `harden` command runs (`python3 setup.py harden <vm>|all`):
+Once the `harden` command runs (`python3 setup.py harden <vm>|all`, or as part of
+`finalize`):
 - The `vagrant` account is disabled/removed on the targeted Windows VMs
 - WinRM basic auth is disabled
 - `vagrant reload`, `vagrant provision`, and `vagrant winrm` commands will NO LONGER WORK
+
+`finalize` (`python3 setup.py finalize <vm>|all`) does this and then `seal`s the
+VMs, in the right order, and also purges the stale `10.0.2.*` (NAT-leak) DNS
+records on DC01 so names resolve on `192.168.200.x` only. `unseal` can restore
+the NAT adapter afterwards, but it does NOT restore the deleted `vagrant`
+account (reach VMs via `Administrator`/`ADMIN_PASS` or the VirtualBox console).
 
 Only harden a machine when it is fully built and ready. To rebuild from scratch:
 ```bash
@@ -358,7 +369,7 @@ All VMs connect via a VirtualBox NAT Network named `SECSCOPE.CORP` (subnet `192.
 
 **WinRM timeout:** Windows VMs are slow on first boot. The Vagrantfile sets `boot_timeout = 300` and `winrm.timeout = 180`. If you still get timeouts, increase these values in the Vagrantfile.
 
-**Box not found:** The two Windows boxes must be built with `python3 setup.py build-boxes` before building any machine (`setup.py build` now preflight-checks this and tells you). `lin01` uses the public `debian/bookworm64` box, fetched automatically.
+**Box not found:** The base boxes must be built with `python3 setup.py build-boxes` before building any machine (`setup.py build` now preflight-checks this and tells you). `build-boxes` builds all three by default — Windows Server 2022, Windows 10, and `secscope/debian-bookworm` (which `lin01` boots from, built locally from the Debian netinst ISO).
 
 **"WS01 not found" during objects provisioning:** Computers must be domain-joined before `dc01_objects.ps1` can apply ACLs to them. The setup scripts run a final objects pass after all VMs are up.
 

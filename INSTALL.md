@@ -158,14 +158,22 @@ Windows boxes must be built from ISO before any VMs can be started.
 
 ### Download ISOs
 
-| ISO | Download | Expected Filename | SHA256 |
+| ISO / Image | Where to get it | Expected Filename | SHA256 |
 |-----|----------|-------------------|--------|
-| Windows Server 2022 | [Direct download](https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso) | `SERVER_EVAL_x64FRE_en-us.iso` | `3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325` |
-| Windows 10 22H2 | [Download page](https://www.microsoft.com/en-us/software-download/windows10ISO) | `Win10_22H2_English_x64v1.iso` | `a6f470ca6d331eb353b815c043e327a347f594f37ff525f17764738fe812852e` |
-| Debian 12.15.0 | [Direct download](https://laotzu.ftp.acc.umu.se/cdimage/archive/12.15.0/amd64/iso-cd/debian-12.15.0-amd64-netinst.iso) | `debian-12.15.0-amd64-netinst.iso` | `cd4462c06aa8892e692c0c4b9c17802f38c8ab8690e85cbfb5ccaa5956e9af17` |
+| Windows Server 2022 (eval) | [Microsoft Evaluation Center](https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022) — choose the **64-bit ISO** | `SERVER_EVAL_x64FRE_en-us.iso` | `3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325` |
+| Windows 10 22H2 | [Microsoft software-download](https://www.microsoft.com/en-us/software-download/windows10ISO) (from Linux the page serves a direct ISO link), **or** build a specific build with [UUP dump](https://uupdump.net/) → *Windows 10 22H2* → *x64* → *English* → Download method "Download and convert to ISO" | `Win10_22H2_English_x64v1.iso` | `a6f470ca6d331eb353b815c043e327a347f594f37ff525f17764738fe812852e` |
+| Debian 12.15.0 netinst | [Direct (archive mirror)](https://laotzu.ftp.acc.umu.se/cdimage/archive/12.15.0/amd64/iso-cd/debian-12.15.0-amd64-netinst.iso) · [canonical archive index](https://cdimage.debian.org/cdimage/archive/12.15.0/amd64/iso-cd/) | `debian-12.15.0-amd64-netinst.iso` | `cd4462c06aa8892e692c0c4b9c17802f38c8ab8690e85cbfb5ccaa5956e9af17` |
+| Kali Linux (attacker) | [Prebuilt VirtualBox VM](https://www.kali.org/get-kali/#kali-virtual-machines) (recommended — import, no install) · [Installer ISO](https://www.kali.org/get-kali/#kali-installer-images) | *(imported VM, not placed in `iso/`)* | *(verify on kali.org)* |
 
-Download the ISOs, rename them to match the expected filenames above, and place them
-in the `iso/` directory. Verify the checksums match:
+The Windows and Debian ISOs go in the `iso/` directory (rename to match the
+expected filename). **Kali is not built by Packer** — it is a separate attacker
+box imported straight into VirtualBox (see §7); it does not go in `iso/`.
+
+> **Windows 10 / UUP dump:** UUP dump produces a multi-edition ISO. The
+> `Autounattend.xml` selects **`Windows 10 Pro`**, which a UUP dump "Pro" or
+> "consumer editions" ISO contains — so either works.
+
+After downloading, verify the checksums match:
 
 **Linux/macOS:**
 ```bash
@@ -194,31 +202,29 @@ Get-FileHash -Algorithm SHA256 iso\Win10_22H2_English_x64v1.iso
 > matching `Autounattend.xml` to an image the ISO actually contains
 > (`dism /Get-WimInfo /WimFile:<mounted>\sources\install.wim` lists them).
 >
-> The **Debian** Packer box is NOT built by default (`setup.py build-boxes`
-> skips it): its preseed build is unreliable and `lin01` boots from the public
-> `debian/bookworm64` box instead. Pass `--with-debian` only if you specifically
-> need to rebuild it.
+> **Debian box:** `lin01` boots from the locally-built `secscope/debian-bookworm`
+> box, which Packer builds from `iso/debian-12.15.0-amd64-netinst.iso`. It is
+> built **by default** by `build-boxes` (alongside the two Windows boxes). If the
+> Debian ISO isn't present it is skipped with a warning (Windows-only users aren't
+> blocked); pass `--skip-debian` to always skip it.
 
 ### Build Boxes
 
-Build the two Windows boxes sequentially:
-
-```bash
-# Build Windows Server 2022 box (~45-90 minutes)
-python3 setup.py build-boxes --server-only
-
-# Build Windows 10 box (~45-90 minutes)
-python3 setup.py build-boxes --workstation-only
-```
-
-Or build both Windows boxes at once (the default):
+Build all three base boxes at once (the default — Windows Server 2022, Windows 10,
+and the Debian box for `lin01`):
 ```bash
 python3 setup.py build-boxes
 ```
+If the Debian ISO isn't in `iso/`, the Debian box is skipped with a warning and
+the two Windows boxes still build.
 
-> The Debian box is **not** part of the default build and is not required — `lin01`
-> boots from the public `debian/bookworm64` box. Only pass `--with-debian`
-> (or `--debian-only`) if you specifically want to rebuild the local Debian box.
+Or build just one box at a time:
+```bash
+python3 setup.py build-boxes --server-only       # Windows Server 2022 (~45-90 min)
+python3 setup.py build-boxes --workstation-only   # Windows 10 (~45-90 min)
+python3 setup.py build-boxes --debian-only        # Debian (for lin01)
+python3 setup.py build-boxes --skip-debian        # both Windows boxes, no Debian
+```
 
 Verify boxes:
 ```bash
@@ -227,10 +233,12 @@ vagrant box list | grep secscope
 
 Should show:
 ```
+secscope/debian-bookworm           (virtualbox, x.x.x)
 secscope/windows-10                (virtualbox, x.x.x)
 secscope/windows-server-2022       (virtualbox, x.x.x)
 ```
-(plus `secscope/debian-bookworm` only if you built it with `--with-debian`.)
+(`secscope/debian-bookworm` appears only if the Debian ISO was present / you
+didn't pass `--skip-debian`. `lin01` requires it.)
 
 If a build fails with "box not found", run `python3 setup.py build-boxes` first.
 
@@ -300,12 +308,22 @@ python3 setup.py build dc01 --quiet     # minimal output
 
 ### Locking down (optional, after building)
 
-`harden` and `seal` are deliberate, separate steps because they cut off Vagrant
-management. Run them only when the machines are finished:
+`harden` and `seal` cut off Vagrant management, so run them only when the
+machines are finished. Easiest is the one-step `finalize`, which runs the whole
+sequence in the correct order (verify internal IPs -> fix NAT-leak DNS ->
+harden -> seal):
+```bash
+python3 setup.py finalize all        # harden + fix DNS + seal, in one step
+python3 setup.py finalize all --no-dns-clean   # ...but skip the DNS purge
+```
+`finalize` also purges the stale `10.0.2.*` (NAT-leak) DNS records from DC01 so
+names resolve on `192.168.200.x` only. The individual steps remain available if
+you want finer control:
 ```bash
 python3 setup.py harden all          # remove vagrant credentials
 python3 setup.py seal all            # single-home each VM on 192.168.200.x
-python3 setup.py unseal <vm>         # (reverse a seal to regain management)
+python3 setup.py unseal <vm>         # (restore the NAT nic1 to regain mgmt;
+                                     #  the deleted vagrant account is NOT restored)
 ```
 
 ---

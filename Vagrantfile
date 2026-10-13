@@ -18,8 +18,8 @@ end
 require_relative 'vagrant_plugins/winrm_quiet'
 
 # ─── Load lab.conf (single source of truth) ──────────────────────────────
-# Flat KEY=value file shared with setup.sh / setup.ps1 so domain, IPs, boxes
-# and passwords live in exactly one place.
+# Flat KEY=value file shared with setup.py so domain, IPs, boxes and passwords
+# live in exactly one place.
 _lab_conf = {}
 _conf_path = File.join(File.dirname(__FILE__), 'lab.conf')
 if File.exist?(_conf_path)

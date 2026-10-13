@@ -1097,8 +1097,62 @@ def cmd_harden(targets, force=False):
             log_skip(f"{vm} not running")
             continue
         log_info(f"Hardening {vm}...")
-        provision(vm, "harden")
-        log_ok(f"{vm} hardened")
+        rc = provision(vm, "harden", password=_harden_password(vm))
+        if rc == 0:
+            log_ok(f"{vm} hardened")
+        else:
+            log_warn(f"{vm} harden returned {rc} - check WinRM/SSH auth")
+    return 0
+
+
+def _harden_password(vm):
+    """WinRM/SSH password the 'harden' provisioner must authenticate with.
+    DCs have no local 'vagrant' account - their WinRM user is Administrator, whose
+    password was reset to ADMIN_PASS by dc01_dns.ps1 - so harden must use
+    ADMIN_PASS there, not the 'vagrant' default. Members (and lin01's SSH) still
+    have vagrant/vagrant, so None lets vagrant use its default."""
+    return ADMIN_PASS if vm in DCS else None
+
+
+def _verify_internal_ip(vm):
+    """Confirm the VM holds its 192.168.200.x internal IP over WinRM (ADMIN_PASS).
+    lin01 is skipped (SSH-managed). Returns True if present/skipped, False if the
+    probe ran but didn't find the IP. Must run BEFORE harden disables basic auth."""
+    if vm == "lin01":
+        return True
+    rc, out = vagrant_winrm(
+        vm,
+        "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '192.168.200.*' }).IPAddress",
+        password=ADMIN_PASS)
+    if "192.168.200." in out:
+        log_ok(f"{vm} internal IP present")
+        return True
+    log_warn(f"{vm} internal 192.168.200.x IP not confirmed - sealing anyway")
+    return False
+
+
+def _seal_vm(vm):
+    """Halt -> poweroff -> remove NAT nic1 -> restart headless, single-homed on
+    192.168.200.x. Returns the modifyvm rc (0 on success). Caller verifies the
+    internal IP first (WinRM is gone after harden)."""
+    name = VBOX_NAME[vm]
+    # Graceful halt (bounded), then hard poweroff so modifyvm can proceed.
+    log_info(f"Halting {vm}...")
+    vagrant(["halt", vm], filter_winrm=True, timeout=60)
+    if vm_running(vm):
+        log_info(f"{vm} still running - forcing poweroff...")
+        vbox(["controlvm", name, "poweroff"])
+    for _ in range(15):
+        if not vm_running(vm):
+            break
+        time.sleep(2)
+    log_info(f"Removing nic1 (NAT) from {name}...")
+    rc, _ = vbox(["modifyvm", name, "--nic1", "none"])
+    if rc != 0:
+        log_warn(f"Could not modify {name}")
+        return rc
+    log_ok(f"{vm} single-homed on SECSCOPE.CORP")
+    vbox(["startvm", name, "--type", "headless"])
     return 0
 
 
@@ -1112,44 +1166,105 @@ def cmd_seal(targets, force=False):
     log_warn("console or an in-network host (Kali .99) afterwards.")
     sealed, failures = 0, 0
     for vm in vms:
-        name = VBOX_NAME[vm]
         if not vm_exists(vm):
             log_skip(f"{vm} not created")
             continue
         if vm_sealed(vm):
             log_skip(f"{vm} already sealed")
             continue
-        if vm != "lin01":
-            rc, out = vagrant_winrm(
-                vm,
-                "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '192.168.200.*' }).IPAddress",
-                password=ADMIN_PASS)
-            if "192.168.200." in out:
-                log_ok(f"{vm} internal IP present")
-            else:
-                log_warn(f"{vm} internal 192.168.200.x IP not confirmed - sealing anyway")
-        # Graceful halt (bounded), then hard poweroff so modifyvm can proceed.
-        log_info(f"Halting {vm}...")
-        vagrant(["halt", vm], filter_winrm=True, timeout=60)
-        if vm_running(vm):
-            log_info(f"{vm} still running - forcing poweroff...")
-            vbox(["controlvm", name, "poweroff"])
-        for _ in range(15):
-            if not vm_running(vm):
-                break
-            time.sleep(2)
-        log_info(f"Removing nic1 (NAT) from {name}...")
-        rc, _ = vbox(["modifyvm", name, "--nic1", "none"])
-        if rc != 0:
-            log_warn(f"Could not modify {name}")
+        _verify_internal_ip(vm)
+        if _seal_vm(vm) != 0:
             failures += 1
             continue
-        log_ok(f"{vm} single-homed on SECSCOPE.CORP")
-        vbox(["startvm", name, "--type", "headless"])
         sealed += 1
     log("")
     log_ok(f"Seal complete - {sealed} VM(s) sealed, {failures} issue(s)")
     return 0 if failures == 0 else 1
+
+
+def cmd_finalize(targets, force=False, dns_clean=True):
+    """End-of-build lockdown: verify internal IPs -> clean NAT-leak DNS ->
+    harden (delete vagrant creds) -> seal (remove NAT nic1). Produces a lab that
+    works on 192.168.200.x only. Ordering matters: harden needs WinRM/SSH, which
+    seal then removes; the IP verify + DNS clean must precede harden (which
+    disables WinRM basic auth)."""
+    preflight()
+    vms = resolve_targets(targets)
+    if not confirm("harden AND seal (delete vagrant creds + remove NAT nic1, "
+                   "sever management of)", vms, force):
+        return 1
+    banner("Finalize - harden + seal (single-homed on 192.168.200.x)")
+    log_warn("This deletes the vagrant account AND removes the NAT nic1.")
+    log_warn("'unseal' can restore the NAT adapter, but the vagrant account is")
+    log_warn("NOT restored - reach VMs via Administrator/ADMIN_PASS, the VirtualBox")
+    log_warn("console, or an in-network host (Kali .99) afterwards.")
+
+    # DC01 last: shrink the window in which it could re-register 10.0.2.15 via
+    # dynamic DNS between the cleanup and its own seal.
+    ordered = [v for v in vms if v != "dc01"] + (["dc01"] if "dc01" in vms else [])
+
+    # 1) Verify internal IPs while WinRM basic auth is still enabled (pre-harden).
+    log_info("Verifying internal 192.168.200.x IPs...")
+    for vm in ordered:
+        if vm_running(vm):
+            _verify_internal_ip(vm)
+        else:
+            log_skip(f"{vm} not running - cannot verify IP")
+
+    # 2) Fix the NAT-leak: purge stale 10.0.2.* records from DC01's DNS so names
+    #    resolve to 192.168.200.x (not a now-dead 10.0.2.15) after sealing.
+    dns_done = False
+    if dns_clean:
+        if vm_running("dc01"):
+            log_info("Cleaning NAT-leak DNS on DC01 (purging stale 10.0.2.* records)...")
+            clean_nat_leak()
+            log_ok("Stale 10.0.2.* records purged + DNS cache cleared")
+            dns_done = True
+        else:
+            log_skip("DC01 not running - skipping NAT-leak DNS cleanup")
+    else:
+        log_skip("DNS cleanup disabled (--no-dns-clean)")
+
+    # 3) Harden each running VM (deletes vagrant creds; disables WinRM basic auth).
+    hardened = 0
+    harden_warn = 0
+    for vm in ordered:
+        if not vm_running(vm):
+            log_skip(f"{vm} not running - skipping harden")
+            continue
+        log_info(f"Hardening {vm}...")
+        # DCs authenticate as Administrator/ADMIN_PASS (no local vagrant account);
+        # members + lin01 keep vagrant/vagrant. Wrong creds here = a long WinRM
+        # auth-retry storm AND a VM left with WinRM basic auth still enabled.
+        rc = provision(vm, "harden", password=_harden_password(vm))
+        if rc == 0:
+            log_ok(f"{vm} hardened")
+            hardened += 1
+        else:
+            log_warn(f"{vm} harden returned {rc} - WinRM/SSH auth likely failed; "
+                     "vagrant creds may NOT be removed")
+            harden_warn += 1
+
+    # 4) Seal each VM (remove NAT nic1). IPs were verified in step 1; WinRM is now
+    #    gone, so _seal_vm does not re-probe.
+    sealed, failures = 0, 0
+    for vm in ordered:
+        if not vm_exists(vm):
+            log_skip(f"{vm} not created")
+            continue
+        if vm_sealed(vm):
+            log_skip(f"{vm} already sealed")
+            continue
+        if _seal_vm(vm) != 0:
+            failures += 1
+            continue
+        sealed += 1
+
+    log("")
+    log_ok(f"Finalize complete - {hardened} hardened, {sealed} sealed, "
+           f"DNS cleaned: {'yes' if dns_done else 'no'}, "
+           f"{failures + harden_warn} issue(s)")
+    return 0 if (failures == 0 and harden_warn == 0) else 1
 
 
 def cmd_unseal(targets):
@@ -1202,12 +1317,16 @@ def cmd_build_boxes(opts):
 
     build_server = not opts.get("workstation_only") and not opts.get("debian_only")
     build_win10 = not opts.get("server_only") and not opts.get("debian_only")
-    # The Debian Packer box is NOT built by default: the preseed build is known
-    # to hang (the installer runs but SSH never comes up -> ~2h Packer timeout)
-    # and the resulting box is orphaned anyway - lin01 boots from the public
-    # 'debian/bookworm64' box (see Vagrantfile), not 'secscope/debian-bookworm'.
-    # Build it only on explicit request (--debian-only / --with-debian).
-    build_debian = bool(opts.get("debian_only") or opts.get("with_debian"))
+    # lin01 boots from the locally built 'secscope/debian-bookworm' box (see
+    # Vagrantfile / DEBIAN_BOX), built from iso/debian-12.15.0-amd64-netinst.iso,
+    # so the Debian box is built BY DEFAULT alongside the two Windows boxes.
+    # Excluded by the Windows-only flags or by --skip-debian; --debian-only builds
+    # only it. If its ISO is absent on a default run it is skipped with a warning
+    # (below) rather than hard-failing, so Windows-only users aren't blocked.
+    build_debian = (not opts.get("server_only") and not opts.get("workstation_only")
+                    and not opts.get("skip_debian"))
+    if opts.get("with_debian"):          # explicit: force it on
+        build_debian = True
     if opts.get("debian_only"):
         build_server = build_win10 = False
         build_debian = True
@@ -1246,9 +1365,16 @@ def cmd_build_boxes(opts):
                   opts.get("win10_iso") or str(iso_dir / "Win10_22H2_English_x64v1.iso"),
                   SCRIPT_DIR / "packer" / "windows-10")
     if build_debian:
-        build_one("debian-bookworm", "secscope/debian-bookworm",
-                  opts.get("debian_iso") or str(iso_dir / "debian-12.15.0-amd64-netinst.iso"),
-                  SCRIPT_DIR / "packer" / "debian-bookworm")
+        debian_iso = (opts.get("debian_iso")
+                      or str(iso_dir / "debian-12.15.0-amd64-netinst.iso"))
+        explicit_debian = bool(opts.get("debian_only") or opts.get("with_debian"))
+        if not Path(debian_iso).exists() and not explicit_debian:
+            log_warn(f"Debian ISO not found ({debian_iso}) - skipping the Debian box.")
+            log_warn("lin01 needs secscope/debian-bookworm; download the ISO (see "
+                     "INSTALL.md) then run: python3 setup.py build-boxes --debian-only")
+        else:
+            build_one("debian-bookworm", "secscope/debian-bookworm", debian_iso,
+                      SCRIPT_DIR / "packer" / "debian-bookworm")
     log_ok("Box build complete")
     return 0
 
@@ -1283,6 +1409,7 @@ examples:
   setup.py status                      Show the state table
   setup.py harden all --force          Strip vagrant creds (after builds)
   setup.py seal all --force            Single-home every VM (final step)
+  setup.py finalize all --force        Harden + fix DNS + seal (one step)
 
 vm inventory:
   DC01  192.168.200.10   DC02 192.168.200.11   DC03 192.168.200.12
@@ -1292,8 +1419,10 @@ vm inventory:
 notes:
   * Each VM can be built only ONCE; rebuilding requires 'rebuild' or --force.
   * You destroy machines yourself; 'destroy' exists but is not part of build.
-  * 'harden' and 'seal' cut off Vagrant/WinRM management - run them last, and
-    they require --force (or an interactive confirmation).
+  * 'harden', 'seal' and 'finalize' cut off Vagrant/WinRM management - run them
+    last, and they require --force (or an interactive confirmation).
+  * 'finalize' = harden + seal in the correct order, and also purges the stale
+    10.0.2.* (NAT-leak) DNS records so names resolve on 192.168.200.x only.
 """
 
 
@@ -1413,6 +1542,21 @@ def build_parser():
                         help="Skip the interactive confirmation.")
     p_seal.set_defaults(func=_run_seal)
 
+    # ── finalize ──
+    p_finalize = sub.add_parser(
+        "finalize", parents=[globals_parent],
+        help="Harden + seal in one step. Requires --force/confirm.",
+        description="End-of-build lockdown: verify internal IPs, fix the NAT-leak\n"
+                    "DNS on DC01, delete the vagrant account, then remove the NAT\n"
+                    "nic1 so each VM is single-homed on 192.168.200.x. Severs\n"
+                    "Vagrant/WinRM/RDP management.")
+    _add_vms_argument(p_finalize)
+    p_finalize.add_argument("--force", action="store_true",
+                            help="Skip the interactive confirmation.")
+    p_finalize.add_argument("--no-dns-clean", action="store_true",
+                            help="Skip purging stale 10.0.2.* records from DC01's DNS.")
+    p_finalize.set_defaults(func=_run_finalize)
+
     # ── unseal ──
     p_unseal = sub.add_parser(
         "unseal", parents=[globals_parent],
@@ -1436,10 +1580,12 @@ def build_parser():
         "build-boxes", parents=[globals_parent],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         help="Build Packer base boxes.",
-        description="Build the Packer base boxes (Windows Server 2022 and "
-                    "Windows 10 by default). The Debian box is NOT built by "
-                    "default (broken/orphaned - lin01 uses debian/bookworm64); "
-                    "pass --with-debian to build it anyway.")
+        description="Build the Packer base boxes. By default builds all three: "
+                    "Windows Server 2022, Windows 10, and the Debian box "
+                    "(secscope/debian-bookworm) that lin01 needs. The Debian box "
+                    "is skipped with a warning if its ISO is absent; use "
+                    "--skip-debian to always skip it, or --debian-only / "
+                    "--server-only / --workstation-only to build just one.")
     only = p_boxes.add_mutually_exclusive_group()
     only.add_argument("--server-only", action="store_true",
                       help="Build only the Windows Server 2022 box.")
@@ -1448,10 +1594,12 @@ def build_parser():
     only.add_argument("--debian-only", action="store_true",
                       help="Build only the Debian box.")
     p_boxes.add_argument("--skip-debian", action="store_true",
-                         help="Deprecated no-op: Debian is already skipped by default.")
+                         help="Do NOT build the Debian box (build only the two "
+                              "Windows boxes). lin01 will then be unbuildable.")
     p_boxes.add_argument("--with-debian", action="store_true",
-                         help="Also build the (experimental, orphaned) Debian box. "
-                              "lin01 uses the public debian/bookworm64 box instead.")
+                         help="Force-build the Debian box even if its ISO lookup "
+                              "would otherwise skip it (redundant: Debian is on by "
+                              "default; hard-fails if the ISO is missing).")
     p_boxes.add_argument("--no-vagrant-add", action="store_true",
                          help="Build boxes but do not add them to Vagrant.")
     p_boxes.add_argument("--server-iso", metavar="PATH", help="Custom Server 2022 ISO.")
@@ -1488,6 +1636,10 @@ def _run_harden(args):
 
 def _run_seal(args):
     return cmd_seal(args.vms, force=args.force)
+
+
+def _run_finalize(args):
+    return cmd_finalize(args.vms, force=args.force, dns_clean=not args.no_dns_clean)
 
 
 def _run_unseal(args):
