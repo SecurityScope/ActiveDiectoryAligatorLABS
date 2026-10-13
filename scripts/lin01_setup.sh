@@ -23,6 +23,14 @@ EOF
 ip link set "$INT_IF" up 2>/dev/null || true
 ip addr add "$LIN01_IP/24" dev "$INT_IF" 2>/dev/null || true
 
+# Set the hostname to lin01 BEFORE the domain join. The Packer box ships with
+# hostname "debian"; adcli/realm enroll the machine under the current hostname,
+# so without this the computer account is created as DEBIAN$ instead of LIN01$.
+echo "[lin01] Setting hostname to lin01..."
+hostnamectl set-hostname lin01 2>/dev/null || { echo "lin01" > /etc/hostname; hostname lin01 2>/dev/null || true; }
+sed -i '/127.0.1.1/d' /etc/hosts
+echo "127.0.1.1 lin01.$DOMAIN_LOWER lin01" >> /etc/hosts
+
 echo "[lin01] Installing required packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
