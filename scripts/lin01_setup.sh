@@ -26,15 +26,17 @@ ip addr add "$LIN01_IP/24" dev "$INT_IF" 2>/dev/null || true
 echo "[lin01] Installing required packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq \
-    sssd sssd-tools realmd adcli \
+# libnss-sss + libpam-sss + sssd-ad are REQUIRED by `realm join` but are only
+# *recommended* by the sssd metapackage, so on a minimal box they're missing and
+# realm aborts "Necessary packages are not installed". Install them explicitly.
+apt-get install -y \
+    sssd sssd-tools sssd-ad libnss-sss libpam-sss realmd adcli \
     krb5-user libpam-krb5 \
-    samba-common-bin \
+    samba-common-bin packagekit \
     openssh-server \
     python3 python3-pip \
     wget curl git \
-    net-tools nmap \
-    2>/dev/null
+    net-tools nmap
 
 echo "[lin01] Configuring DNS to point at DC01..."
 cat > /etc/resolv.conf <<EOF
