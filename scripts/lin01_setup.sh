@@ -64,27 +64,13 @@ cat > /etc/krb5.conf <<EOF
     $DOMAIN_LOWER = $DOMAIN_UPPER
 EOF
 
-echo "[lin01] Configuring SSSD..."
-cat > /etc/sssd/sssd.conf <<EOF
-[sssd]
-domains = $DOMAIN_LOWER
-config_file_version = 2
-services = nss, pam
-
-[domain/$DOMAIN_LOWER]
-ad_domain = $DOMAIN_LOWER
-krb5_realm = $DOMAIN_UPPER
-realmd_tags = manages-system joined-with-adcli
-cache_credentials = True
-id_provider = ad
-krb5_store_password_if_offline = True
-default_shell = /bin/bash
-ldap_id_mapping = True
-use_fully_qualified_names = False
-fallback_homedir = /home/%u
-access_provider = ad
-EOF
-chmod 600 /etc/sssd/sssd.conf
+# NOTE: Do NOT pre-write /etc/sssd/sssd.conf here. If an sssd.conf with this
+# domain already exists, `realm join` reports "Already joined to this domain"
+# and SKIPS the actual join - so no LIN01$ computer account is created in AD and
+# no machine keytab is fetched (the host only *looks* joined locally). Let
+# `realm join` create sssd.conf and do the real join; the lab-specific SSSD
+# tweaks are applied AFTER the join, below.
+rm -f /etc/sssd/sssd.conf
 
 echo "[lin01] Waiting for DC01 to be reachable..."
 for i in $(seq 1 30); do
@@ -116,6 +102,31 @@ if [ "$join_rc" -ne 0 ]; then
     fi
 else
     echo "[lin01] realm join succeeded"
+fi
+
+# Verify the join actually created the machine account / keytab (realm can report
+# a misleading state). If LIN01$ keys aren't in the keytab, the join didn't work.
+if ! klist -k /etc/krb5.keytab 2>/dev/null | grep -qiE "LIN01\\\$@"; then
+    echo "[lin01] ERROR: no LIN01\$ keys in /etc/krb5.keytab - the realm join did not complete"
+    exit 1
+fi
+echo "[lin01] Machine account keytab present (join confirmed)"
+
+echo "[lin01] Applying lab SSSD settings (short usernames, home dirs, offline creds)..."
+# realm join writes a default sssd.conf (fully-qualified names, /home/%u@%d).
+# Tweak it for the lab AFTER the join so we don't block the join itself.
+if [ -f /etc/sssd/sssd.conf ]; then
+    sed -i 's/^use_fully_qualified_names.*/use_fully_qualified_names = False/' /etc/sssd/sssd.conf
+    sed -i 's#^fallback_homedir.*#fallback_homedir = /home/%u#' /etc/sssd/sssd.conf
+    grep -q '^use_fully_qualified_names' /etc/sssd/sssd.conf || sed -i "/^\[domain\/$DOMAIN_LOWER\]/a use_fully_qualified_names = False" /etc/sssd/sssd.conf
+    grep -q '^fallback_homedir'          /etc/sssd/sssd.conf || sed -i "/^\[domain\/$DOMAIN_LOWER\]/a fallback_homedir = /home/%u" /etc/sssd/sssd.conf
+    grep -q '^cache_credentials'         /etc/sssd/sssd.conf || sed -i "/^\[domain\/$DOMAIN_LOWER\]/a cache_credentials = True" /etc/sssd/sssd.conf
+    grep -q '^default_shell'             /etc/sssd/sssd.conf || sed -i "/^\[domain\/$DOMAIN_LOWER\]/a default_shell = /bin/bash" /etc/sssd/sssd.conf
+    chmod 600 /etc/sssd/sssd.conf
+    systemctl restart sssd 2>/dev/null || service sssd restart 2>/dev/null || true
+    echo "[lin01] SSSD settings applied + restarted"
+else
+    echo "[lin01] WARNING: /etc/sssd/sssd.conf not found after join"
 fi
 
 echo "[lin01] Enabling SSH with password auth..."
