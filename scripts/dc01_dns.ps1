@@ -213,6 +213,17 @@ foreach ($name in $records.Keys) {
     }
 }
 
+Write-Host "[dc01_dns] Enabling DNS zone transfer / AXFR (intentional recon misconfig)..."
+try {
+    # AD-integrated zones refuse AXFR by default. Allow transfer to any server so
+    # the Network Recon module's 'dig axfr $domain @dc01' / fierce / dnsrecon
+    # zone-transfer exercise actually dumps the zone.
+    Set-DnsServerPrimaryZone -Name $domain -SecureSecondaries TransferToAnyServer -ErrorAction Stop
+    Write-Host "[dc01_dns] Zone transfer enabled on $domain (AXFR to any server)"
+} catch {
+    Write-Host "[dc01_dns] Could not enable zone transfer (may already be set): $_"
+}
+
 # NOTE: The child-domain ('it') DNS delegation and the it.secscope.corp
 # conditional forwarder are deliberately NOT created here. Creating them before
 # DC03 is promoted makes DC01 answer authoritatively for the child zone, so

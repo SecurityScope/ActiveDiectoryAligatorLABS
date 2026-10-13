@@ -156,6 +156,37 @@ if (-not $connected) {
     Write-Host "[srv01_services] WARNING: Could not enable xp_cmdshell after 5 attempts"
 }
 
+Write-Host "[srv01_services] Creating a linked SQL server (SQL-links lateral path)..."
+if ($connected) {
+    try {
+        $sqlConn = New-Object System.Data.SqlClient.SqlConnection(
+            "Server=(local)\SQLEXPRESS;User Id=sa;Password=$adminPass;")
+        $sqlConn.Open()
+        $sqlCmd = $sqlConn.CreateCommand()
+        # Self-referential linked server with 'rpc out' + an sa login mapping. Lets
+        # an attacker on SQLEXPRESS enumerate links (sys.servers / sp_linkedservers)
+        # and pivot via  EXEC ('...') AT [SRV01_LINK]  / OPENQUERY - the classic
+        # MSSQL linked-server exercise (Module 10). Single instance, so it loops
+        # back to itself, which is enough to practise the technique end-to-end.
+        $sqlCmd.CommandText = @"
+IF NOT EXISTS (SELECT 1 FROM sys.servers WHERE name = 'SRV01_LINK')
+BEGIN
+    EXEC sp_addlinkedserver @server=N'SRV01_LINK', @srvproduct=N'', @provider=N'SQLNCLI', @datasrc=N'SRV01\SQLEXPRESS';
+    EXEC sp_serveroption @server=N'SRV01_LINK', @optname=N'rpc out', @optvalue=N'true';
+    EXEC sp_serveroption @server=N'SRV01_LINK', @optname=N'data access', @optvalue=N'true';
+    EXEC sp_addlinkedsrvlogin @rmtsrvname=N'SRV01_LINK', @useself=N'false', @locallogin=NULL, @rmtuser=N'sa', @rmtpassword=N'$adminPass';
+END
+"@
+        $sqlCmd.ExecuteNonQuery() | Out-Null
+        $sqlConn.Close()
+        Write-Host "[srv01_services] Linked server SRV01_LINK created (rpc out enabled)"
+    } catch {
+        Write-Host "[srv01_services] WARNING: linked server setup failed: $_"
+    }
+} else {
+    Write-Host "[srv01_services] Skipping linked server (SQL not reachable)"
+}
+
 Write-Host "[srv01_services] Installing ADCS (Certificate Authority)..."
 Install-WindowsFeature -Name AD-Certificate, ADCS-Cert-Authority, ADCS-Web-Enrollment -IncludeManagementTools
 $secPass = ConvertTo-SecureString $adminPass -AsPlainText -Force
@@ -299,6 +330,59 @@ try {
 } catch {
     Write-Host "[srv01_services] ESC1 template creation failed: $_"
     Write-Host "[srv01_services] Manual: certsrv.msc -> Duplicate 'User' -> Supply in request -> Domain Users Enroll"
+}
+
+# ── WebDAV (server) + WebClient (HTTP->LDAP / ADCS-ESC8 relay coercion target) ─
+Write-Host "[srv01_services] Enabling WebDAV + WebClient (relay/coercion target)..."
+try {
+    Install-WindowsFeature -Name Web-DAV-Publishing -ErrorAction SilentlyContinue | Out-Null
+    # WebClient (the WebDAV client redirector) is what lets this host be coerced
+    # into authenticating to an attacker over HTTP, enabling NTLM relay to LDAP/ADCS
+    # (Module 09/10). The feature may need a reboot before the service registers.
+    Install-WindowsFeature -Name WebDAV-Redirector -ErrorAction SilentlyContinue | Out-Null
+    $wc = Get-Service WebClient -ErrorAction SilentlyContinue
+    if ($wc) {
+        Set-Service WebClient -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service WebClient -ErrorAction SilentlyContinue
+        Write-Host "[srv01_services] WebClient service enabled + started"
+    } else {
+        Write-Host "[srv01_services] WebClient not present yet (WebDAV-Redirector registers it after a reboot)"
+    }
+} catch {
+    Write-Host "[srv01_services] WARNING: WebDAV/WebClient setup incomplete: $_"
+}
+
+# ── DHCP server role (Module 04 DHCP enumeration target) ──────────────────────
+# Scope is OUTSIDE the lab's static range (.10-.99) so it never hands a lab host a
+# conflicting lease - the whole lab is static, so nothing sends DHCP DISCOVER.
+# Authorizing a DHCP server needs Enterprise Admin, which this local-account
+# provisioner may lack; the role + scope stay enumerable even if auth is skipped.
+Write-Host "[srv01_services] Installing DHCP server role (enumeration target)..."
+try {
+    if ((Get-WindowsFeature DHCP).InstallState -ne "Installed") {
+        Install-WindowsFeature -Name DHCP -IncludeManagementTools -ErrorAction Stop | Out-Null
+        Write-Host "[srv01_services] DHCP role installed"
+    } else {
+        Write-Host "[srv01_services] DHCP role already installed"
+    }
+    Import-Module DhcpServer -ErrorAction SilentlyContinue
+    try {
+        Add-DhcpServerInDC -DnsName "srv01.$domain" -IPAddress 192.168.200.20 -ErrorAction Stop
+        Write-Host "[srv01_services] DHCP server authorized in AD"
+    } catch {
+        Write-Host "[srv01_services] NOTE: DHCP AD authorization skipped (needs Enterprise Admin): $_"
+    }
+    if (-not (Get-DhcpServerv4Scope -ScopeId 192.168.200.0 -ErrorAction SilentlyContinue)) {
+        Add-DhcpServerv4Scope -Name "LabScope" -StartRange 192.168.200.200 -EndRange 192.168.200.220 `
+            -SubnetMask 255.255.255.0 -State Active -ErrorAction SilentlyContinue
+        Set-DhcpServerv4OptionValue -ScopeId 192.168.200.0 -DnsServer 192.168.200.10 `
+            -Router 192.168.200.1 -ErrorAction SilentlyContinue
+        Write-Host "[srv01_services] DHCP scope 192.168.200.200-220 created (non-conflicting)"
+    } else {
+        Write-Host "[srv01_services] DHCP scope already present"
+    }
+} catch {
+    Write-Host "[srv01_services] WARNING: DHCP setup incomplete: $_"
 }
 
 Write-Host "[srv01_services] Done"

@@ -74,4 +74,18 @@ if ($nic2) {
     Set-DnsClient -InterfaceIndex $idx -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false
 }
 
+# Ensure the Print Spooler is running + Automatic so the DC can be coerced over
+# MS-RPRN (PrinterBug). This is the trigger for the unconstrained-delegation
+# capture (coerce DC01 -> WS02's unconstrained host -> capture the DC01$ TGT ->
+# DCSync) and for ADCS ESC8 relay. Server has it on by default; set it explicitly
+# so the exercise never depends on that default.
+Write-Host "[$logPrefix] Ensuring Print Spooler is enabled (PrinterBug coercion target)..."
+try {
+    Set-Service -Name Spooler -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service -Name Spooler -ErrorAction SilentlyContinue
+    Write-Host "[$logPrefix] Print Spooler running + Automatic"
+} catch {
+    Write-Host "[$logPrefix] Could not ensure Spooler: $_"
+}
+
 Write-Host "[$logPrefix] Done. Vagrant reload provisioner will reboot to apply changes."

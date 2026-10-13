@@ -557,6 +557,86 @@ if ($exch01Ready) {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
+# Additional attack paths (curriculum gap closers)
+#   - Protocol transition / S4U2self on svc_web   (Kerberos module)
+#   - GenericAll over a user -> ForceChangePassword / targeted Kerberoast /
+#     malicious scriptPath, granted to HelpDesk over leia   (Authorization module)
+#   - Credential planted in a user Description     (AD Objects module)
+#   - DnsAdmins membership -> DLL-on-DC            (AD Objects module)
+#   - GPO-edit delegation -> GPO abuse             (Authorization module)
+# ══════════════════════════════════════════════════════════════════════════
+
+Write-Host "[objects] Configuring protocol-transition (S4U2self) delegation on svc_web..."
+try {
+    # svc_web already owns HTTP/srv01 (SPNs above). TrustedToAuthForDelegation=$true
+    # + msDS-AllowedToDelegateTo = constrained delegation WITH protocol transition:
+    # compromise svc_web -> S4U2self (impersonate any user to svc_web) -> S4U2proxy
+    # to CIFS/ws01. SRV01's computer object keeps the classic NO-protocol-transition
+    # variant above, so both delegation flavours are practiceable.
+    Set-ADAccountControl -Identity svc_web -TrustedToAuthForDelegation $true -ErrorAction Stop
+    Set-ADUser svc_web -Add @{'msDS-AllowedToDelegateTo'=@('CIFS/ws01.secscope.corp','CIFS/WS01')} -ErrorAction Stop
+    Write-Host "[objects] Protocol-transition delegation set on svc_web (-> CIFS/ws01)"
+} catch {
+    Write-Host "[objects] svc_web protocol-transition delegation may already be set: $_"
+}
+
+Write-Host "[objects] Granting HelpDesk GenericAll over user leia (ForceChangePassword / targeted Kerberoast / scriptPath)..."
+try {
+    $leiaDN = (Get-ADUser leia).DistinguishedName
+    $helpdeskSID = (Get-ADGroup HelpDesk).SID
+    $acl = Get-Acl "AD:\$leiaDN"
+    $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        $helpdeskSID,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow,
+        [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+    )
+    $acl.AddAccessRule($rule)
+    Set-Acl "AD:\$leiaDN" $acl
+    # han is in HelpDesk -> han can reset leia's password, OR write an SPN onto
+    # leia and Kerberoast her (targeted Kerberoast), OR set her scriptPath.
+    Write-Host "[objects] GenericAll over leia granted to HelpDesk"
+} catch {
+    Write-Host "[objects] GenericAll over leia may already be set: $_"
+}
+
+Write-Host "[objects] Planting a credential in a user Description..."
+try {
+    Set-ADUser -Identity luke -Description "Temp pw reset to Spring2024! per ticket #4412 - rotate after use" -ErrorAction Stop
+    Write-Host "[objects] Credential planted in luke's Description (Get-ADUser -Filter * -Properties Description)"
+} catch {
+    Write-Host "[objects] Could not set luke Description: $_"
+}
+
+Write-Host "[objects] Adding han to DnsAdmins (DLL-on-DC escalation path)..."
+Add-GroupMember-IfMissing -Group "DnsAdmins" -Member "han"
+
+Write-Host "[objects] Delegating GPO-edit rights (GPO abuse -> lateral movement)..."
+try {
+    Import-Module GroupPolicy -ErrorAction Stop
+    # han can create brand-new GPOs...
+    Add-GroupMember-IfMissing -Group "Group Policy Creator Owners" -Member "han"
+    # ...and HelpDesk can EDIT a GPO linked to the Workstations OU, so editing it
+    # (e.g. an Immediate Scheduled Task) runs code on ws01/ws02.
+    $gpoName = "Workstation-Policy"
+    if (-not (Get-GPO -Name $gpoName -ErrorAction SilentlyContinue)) {
+        New-GPO -Name $gpoName -ErrorAction Stop | Out-Null
+        Write-Host "[objects] Created GPO '$gpoName'"
+    }
+    $wsOU = "OU=Workstations,$itDN"
+    $linked = (Get-GPInheritance -Target $wsOU -ErrorAction SilentlyContinue).GpoLinks |
+        Where-Object { $_.DisplayName -eq $gpoName }
+    if (-not $linked) {
+        New-GPLink -Name $gpoName -Target $wsOU -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
+    }
+    Set-GPPermission -Name $gpoName -TargetName "HelpDesk" -TargetType Group `
+        -PermissionLevel GpoEditDeleteModifySecurity -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "[objects] HelpDesk granted edit on GPO '$gpoName' (linked to $wsOU)"
+} catch {
+    Write-Host "[objects] GPO-edit delegation skipped: $_"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
 # Cross-domain trust exploitation setup (it.secscope.corp)
 # After dc03 subdomain is promoted, the trust accounts are created:
 #   - IT$ in secscope.corp (trust account, stores trust key)
