@@ -191,27 +191,27 @@ DOMAIN = "secscope.corp"
 CHILD_DOMAIN = "it.secscope.corp"
 SERVER_BOX = "secscope/windows-server-2022"
 WORKSTATION_BOX = "secscope/windows-10"
+DEBIAN_BOX = "secscope/debian-bookworm"
 IPS = {}
 
 # Which Packer box each VM boots from (for the build-time box preflight).
-# lin01 uses the public debian/bookworm64 box, which Vagrant fetches on demand,
-# so it needs no local box preflight.
 def _vm_box(vm):
     if vm in ("ws01", "ws02"):
         return WORKSTATION_BOX
     if vm == "lin01":
-        return None
+        return DEBIAN_BOX
     return SERVER_BOX
 
 
 def init_conf():
-    global CONF, ADMIN_PASS, DOMAIN, CHILD_DOMAIN, SERVER_BOX, WORKSTATION_BOX, IPS
+    global CONF, ADMIN_PASS, DOMAIN, CHILD_DOMAIN, SERVER_BOX, WORKSTATION_BOX, DEBIAN_BOX, IPS
     CONF = load_lab_conf()
     ADMIN_PASS = os.environ.get("ADMIN_PASS") or CONF.get("ADMIN_PASS", "vagrant")
     DOMAIN = CONF.get("DOMAIN", "secscope.corp")
     CHILD_DOMAIN = CONF.get("CHILD_DOMAIN", "it.secscope.corp")
     SERVER_BOX = CONF.get("SERVER_BOX", "secscope/windows-server-2022")
     WORKSTATION_BOX = CONF.get("WORKSTATION_BOX", "secscope/windows-10")
+    DEBIAN_BOX = CONF.get("DEBIAN_BOX", "secscope/debian-bookworm")
     IPS = {
         "dc01": CONF.get("DC01_IP", "192.168.200.10"),
         "dc02": CONF.get("DC02_IP", "192.168.200.11"),
@@ -351,10 +351,16 @@ def preflight_boxes(vms):
     installed = out if rc == 0 else ""
     absent = sorted(b for b in needed if b not in installed)
     if absent:
+        hint = "python3 setup.py build-boxes"
+        if DEBIAN_BOX in absent:
+            # Debian is opt-in in build-boxes, so point at the right flag.
+            hint = ("python3 setup.py build-boxes --with-debian"
+                    if absent == [DEBIAN_BOX]
+                    else "python3 setup.py build-boxes  (and add --with-debian for the Debian box)")
         raise LabError(
             "Required Vagrant box(es) not installed: "
             f"{', '.join(absent)}.\n"
-            "       Build the base boxes first:  python3 setup.py build-boxes"
+            f"       Build the base boxes first:  {hint}"
         )
 
 
@@ -1241,7 +1247,7 @@ def cmd_build_boxes(opts):
                   SCRIPT_DIR / "packer" / "windows-10")
     if build_debian:
         build_one("debian-bookworm", "secscope/debian-bookworm",
-                  opts.get("debian_iso") or str(iso_dir / "debian-12.15.0-amd64-netinst-preseed.iso"),
+                  opts.get("debian_iso") or str(iso_dir / "debian-12.15.0-amd64-netinst.iso"),
                   SCRIPT_DIR / "packer" / "debian-bookworm")
     log_ok("Box build complete")
     return 0

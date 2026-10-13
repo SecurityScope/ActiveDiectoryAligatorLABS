@@ -9,8 +9,8 @@ packer {
 
 variable "iso_path" {
   type        = string
-  default     = "iso/debian-12.15.0-amd64-netinst-preseed.iso"
-  description = "Path to Debian Bookworm net-install ISO (with baked-in preseed)"
+  default     = "iso/debian-12.15.0-amd64-netinst.iso"
+  description = "Path to the Debian Bookworm net-install ISO (plain; preseed is served over HTTP)"
 }
 
 variable "iso_checksum" {
@@ -34,22 +34,46 @@ source "virtualbox-iso" "debian-bookworm" {
   iso_url               = var.iso_path
   iso_checksum          = var.iso_checksum == "none" ? "none" : "sha256:${var.iso_checksum}"
   disk_size             = 20480
-  memory                = 1024
+  memory                = 2048
   cpus                  = 2
   headless              = true
   guest_os_type         = "Debian_64"
   communicator          = "ssh"
   ssh_username          = "vagrant"
   ssh_password          = "vagrant"
-  ssh_timeout           = "2h"
+  ssh_timeout           = "30m"
+  ssh_handshake_attempts = "100"
   shutdown_command      = "sudo shutdown -P now"
   shutdown_timeout      = "5m"
   output_directory      = var.output_directory
   guest_additions_mode  = "attach"
 
-  boot_wait             = "5s"
+  # Serve the preseed over HTTP so we don't depend on a baked-in-preseed ISO.
+  http_directory        = "packer/debian-bookworm/http"
+
+  # Interrupt the isolinux boot menu (<esc> -> boot: prompt), then start the
+  # text installer with our HTTP preseed. The old boot_command was just
+  # ["<wait>"], which never started an automated install, so the installer sat
+  # at its menu forever and SSH never came up.
+  boot_wait             = "10s"
   boot_command = [
-    "<wait>"
+    "<esc><wait>",
+    "install <wait>",
+    "preseed/url=http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg <wait>",
+    "debian-installer=en_US.UTF-8 <wait>",
+    "auto=true <wait>",
+    "priority=critical <wait>",
+    "locale=en_US.UTF-8 <wait>",
+    "kbd-chooser/method=us <wait>",
+    "keyboard-configuration/xkb-keymap=us <wait>",
+    "netcfg/get_hostname=debian <wait>",
+    "netcfg/get_domain=local <wait>",
+    "netcfg/choose_interface=auto <wait>",
+    "fb=false <wait>",
+    "debconf/frontend=noninteractive <wait>",
+    "console-setup/ask_detect=false <wait>",
+    "console-keymaps-at/keymap=us <wait>",
+    "<enter><wait>"
   ]
 
   vboxmanage = [

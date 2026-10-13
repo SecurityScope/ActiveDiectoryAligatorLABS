@@ -64,6 +64,7 @@ DC_WINRM_PASSWORD = ENV['DC_WINRM_PASSWORD'] || "vagrant"
 
 SERVER_BOX      = _lab_conf['SERVER_BOX']
 WORKSTATION_BOX = _lab_conf['WORKSTATION_BOX']
+DEBIAN_BOX      = _lab_conf['DEBIAN_BOX'] || 'secscope/debian-bookworm'
 
 # ─── Helper: define a Windows VM with common boilerplate ─────────────────
 # NOTE: `ip:` is informational only (documents each VM's intended internal
@@ -383,17 +384,16 @@ Vagrant.configure("2") do |config|
   # ─── LIN01 ─── Debian Linux Domain Member ─────────────────────────────────
 
   config.vm.define "lin01" do |vm|
-    vm.vm.box = "debian/bookworm64"
+    # Local Packer-built Debian 12 box (from iso/debian-12.15.0-amd64-netinst.iso
+    # via `python3 setup.py build-boxes --with-debian`), so the lab has no
+    # Vagrant Cloud dependency. The box already ships matching Guest Additions.
+    vm.vm.box = DEBIAN_BOX
     vm.ssh.username = "vagrant"
     vm.ssh.insert_key = false
 
-    # The debian/bookworm64 box ships GuestAdditions 6.0.0 while the host runs
-    # VirtualBox 7.2. vagrant-vbguest tries to rebuild them on boot, which runs
-    # `apt-get install linux-headers-$(uname -r)` - a headers package that is
-    # not present in the box's apt sources (E: Unable to locate package
-    # linux-headers-6.1.0-29-amd64), aborting the boot. lin01 relies on the
-    # uploaded shell provisioner, not shared folders, so GuestAdditions are not
-    # needed here - disable the auto-rebuild.
+    # The Packer box ships Guest Additions built against its own kernel, so the
+    # vagrant-vbguest auto-rebuild is unnecessary (and its headers-install step
+    # is fragile); lin01 uses the uploaded shell provisioner, not shared folders.
     vm.vbguest.auto_update = false if Vagrant.has_plugin?("vagrant-vbguest")
 
     vm.vm.network "forwarded_port", guest: 22, host: 22240, auto_correct: true
