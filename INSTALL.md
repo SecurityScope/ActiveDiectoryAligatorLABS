@@ -1,5 +1,7 @@
 # Active Directory Alligator Labs — Installation Guide
 
+> 🌐 **English:** this file · **العربية:** [INSTALL_AR.md](INSTALL_AR.md) | Arabic overview: [README_AR.md](README_AR.md)
+
 Step-by-step instructions to go from zero to a fully working Active Directory lab.
 
 ## Pre-Installation Checklist

@@ -2,6 +2,8 @@
 
 <p align="center"><img src="images/logo.png" alt="Logo" width="450"/></p>
 
+> 🌐 **English:** this file · **العربية:** [README_AR.md](README_AR.md) | Arabic install guide: [INSTALL_AR.md](INSTALL_AR.md)
+
 A self-contained Active Directory lab environment with intentional misconfigurations for penetration testing practice.
 
 ## Overview
