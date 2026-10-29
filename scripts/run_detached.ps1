@@ -64,6 +64,8 @@ $outLog = "C:\Windows\Temp\$taskName.out.log"
 $errLog = "C:\Windows\Temp\$taskName.err.log"
 $lines += ('$p = Start-Process -FilePath powershell.exe -ArgumentList @("-NonInteractive","-NoProfile","-ExecutionPolicy","Bypass","-File","' + $localScript + '") -RedirectStandardOutput ''' + $outLog + ''' -RedirectStandardError ''' + $errLog + ''' -Wait -PassThru')
 $lines += ('Set-Content -Path ''' + $donePath + ''' -Value ("rc=" + $p.ExitCode) -Encoding ASCII')
+$lines += ('schtasks.exe /Delete /TN "' + $taskName + '" /F 2>&1 | Out-Null')
+$lines += ('Remove-Item -LiteralPath "' + $localScript + '" -Force -ErrorAction SilentlyContinue')
 if ($doReboot) {
     $lines += 'if ($p.ExitCode -eq 0) { Restart-Computer -Force }'
 }

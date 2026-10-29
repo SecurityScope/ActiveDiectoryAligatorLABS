@@ -234,6 +234,11 @@ def _vm_box(vm):
     return SERVER_BOX
 
 
+def _domain_dn(domain):
+    """Convert 'secscope.corp' to 'DC=secscope,DC=corp'."""
+    return ",".join(f"DC={part}" for part in domain.split("."))
+
+
 def init_conf():
     global CONF, ADMIN_PASS, DOMAIN, CHILD_DOMAIN, SERVER_BOX, WORKSTATION_BOX, DEBIAN_BOX, IPS
     CONF = load_lab_conf()
@@ -296,6 +301,7 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
             proc = subprocess.Popen(
                 cmd, env=full_env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True,
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError:
             raise LabError(f"Executable not found: {cmd[0]}")
@@ -322,6 +328,7 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
         proc = subprocess.Popen(
             cmd, env=full_env, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
+            start_new_session=(os.name != "nt"),
         )
     except FileNotFoundError:
         raise LabError(f"Executable not found: {cmd[0]}")
@@ -342,8 +349,9 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
     if timeout is not None:
         def _on_timeout():
             nonlocal timed_out
-            timed_out = True
-            _kill_process_tree(proc)
+            if proc.poll() is None:
+                timed_out = True
+                _kill_process_tree(proc)
 
         timer = threading.Timer(timeout, _on_timeout)
         timer.daemon = True
@@ -417,6 +425,8 @@ def vagrant_winrm(vm, ps, password=None, timeout=120):
 
 
 def vbox(args, capture=True):
+    if VBOXMANAGE is None:
+        raise LabError("VBoxManage not found. Install VirtualBox first.")
     rc, out = run([VBOXMANAGE] + args, capture=capture)
     return rc, out
 
@@ -484,9 +494,24 @@ def vm_running(vm):
     return f'"{VBOX_NAME[vm]}"' in vbox_running_names()
 
 
+_cached_machine_folder = None
+
+
 def _vm_dir(name):
-    """Default VirtualBox per-VM directory for a given VM name."""
-    return Path.home() / "VirtualBox VMs" / name
+    """VirtualBox per-VM directory, queried from VBoxManage systemproperties."""
+    global _cached_machine_folder
+    if _cached_machine_folder is None:
+        try:
+            rc, out = vbox(["list", "systemproperties"], capture=True)
+            for line in (out or "").splitlines():
+                if "Default machine folder" in line:
+                    _cached_machine_folder = line.split(":", 1)[1].strip()
+                    break
+        except LabError:
+            pass
+        if _cached_machine_folder is None:
+            _cached_machine_folder = str(Path.home() / "VirtualBox VMs")
+    return Path(_cached_machine_folder) / name
 
 
 def _vbox_inventory():
@@ -590,7 +615,7 @@ def _ad_cleanup_script(vm, is_dc, dry_run):
     script = r'''
 $ErrorActionPreference = 'Continue'
 $vmName   = '__VM_NAME__'
-$domainDN = 'DC=secscope,DC=corp'
+$domainDN = '__DOMAIN_DN__'
 $isDc     = __IS_DC__
 $dry      = __DRY__
 $site = 'Default-First-Site-Name'
@@ -654,6 +679,7 @@ foreach ($z in (Get-DnsServerZone -ErrorAction SilentlyContinue)) {
 Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
 '''
     return (script.replace('__VM_NAME__', vm.upper())
+                  .replace('__DOMAIN_DN__', _domain_dn(DOMAIN))
                   .replace('__IS_DC__', '$true' if is_dc else '$false')
                   .replace('__DRY__', '$true' if dry_run else '$false'))
 
@@ -931,9 +957,10 @@ def _clean_stale_dc_parent(vm):
 def clean_stale_child_domain(password=None):
     log_info("Cleaning stale child-domain metadata on DC01 (for DC03 rebuild)...")
     password = password or ADMIN_PASS
-    ps = r'''
-$childDN = "DC=it,DC=secscope,DC=corp"
-$partitionsDN = "CN=Partitions,CN=Configuration,DC=secscope,DC=corp"
+    child_label = CHILD_DOMAIN.split(".")[0]
+    ps = (r'''
+$childDN = "__CHILD_DN__"
+$partitionsDN = "CN=Partitions,CN=Configuration,__DOMAIN_DN__"
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 $dc03Present = $false
 try { if (Get-ADComputer -Identity "DC03" -ErrorAction Stop) { $dc03Present = $true } } catch {}
@@ -945,14 +972,18 @@ if ($dc03Present) {
         foreach ($cr in $crossRefs) { Remove-ADObject -Identity $cr.DistinguishedName -Recursive -Confirm:$false -ErrorAction Stop }
     } catch {}
     Import-Module DnsServer -ErrorAction SilentlyContinue
-    Get-DnsServerResourceRecord -ZoneName "secscope.corp" -Name "it" -RRType NS -ErrorAction SilentlyContinue | ForEach-Object {
-        Remove-DnsServerResourceRecord -ZoneName "secscope.corp" -InputObject $_ -Force -ErrorAction SilentlyContinue
+    Get-DnsServerResourceRecord -ZoneName "__DOMAIN__" -Name "__CHILD_LABEL__" -RRType NS -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-DnsServerResourceRecord -ZoneName "__DOMAIN__" -InputObject $_ -Force -ErrorAction SilentlyContinue
     }
-    $fwd = Get-DnsServerZone -Name "it.secscope.corp" -ErrorAction SilentlyContinue
-    if ($fwd -and $fwd.ZoneType -eq "Forwarder") { Remove-DnsServerZone -Name "it.secscope.corp" -Force -ErrorAction SilentlyContinue }
+    $fwd = Get-DnsServerZone -Name "__CHILD_DOMAIN__" -ErrorAction SilentlyContinue
+    if ($fwd -and $fwd.ZoneType -eq "Forwarder") { Remove-DnsServerZone -Name "__CHILD_DOMAIN__" -Force -ErrorAction SilentlyContinue }
     Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
 }
-'''
+'''   .replace("__CHILD_DN__", _domain_dn(CHILD_DOMAIN))
+      .replace("__DOMAIN_DN__", _domain_dn(DOMAIN))
+      .replace("__DOMAIN__", DOMAIN)
+      .replace("__CHILD_LABEL__", child_label)
+      .replace("__CHILD_DOMAIN__", CHILD_DOMAIN))
     with DC01_LOCK:
         vagrant_winrm("dc01", ps, password=password, timeout=180)
 

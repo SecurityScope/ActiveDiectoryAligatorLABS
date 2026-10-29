@@ -1,8 +1,8 @@
 # nla_recheck.ps1
 # Boot-time NLA/DNS repair for the lab's internal 192.168.200.0/24 adapter.
 # Registered as the NLA-Recheck scheduled task (SYSTEM, at startup, 30s delay)
-# by common_windows.ps1, and runnable manually (e.g. over Guest Additions) after
-# sealing. Keep this file in sync with the $nlaBody block in common_windows.ps1.
+# by common_windows.ps1 (which copies this file to the guest), and runnable
+# manually (e.g. over Guest Additions) after sealing.
 $ErrorActionPreference = "Continue"
 
 $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
@@ -46,9 +46,15 @@ if ($domain) {
     $suffixes = @($domain)
     if ($domain -ne "secscope.corp") { $suffixes += "secscope.corp" }
     Set-DnsClientGlobalSetting -SuffixSearchList $suffixes -ErrorAction SilentlyContinue
-    Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("127.0.0.1", "192.168.200.10") -ErrorAction SilentlyContinue
+    $isDnsServer = [bool](Get-Service DNS -ErrorAction SilentlyContinue)
+    if ($isDnsServer) {
+        Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("127.0.0.1", "192.168.200.10") -ErrorAction SilentlyContinue
+    } else {
+        Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses @("192.168.200.10") -ErrorAction SilentlyContinue
+    }
     nltest /dsgetdc:$domain 2>&1 | Out-Null
-    Write-Output "[nla] DNS suffix=$domain, servers=127.0.0.1,192.168.200.10"
+    $dnsAddrs = (Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ","
+    Write-Output "[nla] DNS suffix=$domain, servers=$dnsAddrs"
 }
 
 # Give NLA a few seconds to notice the new suffix/default-route before forcing a

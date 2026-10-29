@@ -100,6 +100,14 @@ try {
     Write-Host "[harden] WinRM basic auth already disabled"
 }
 
+# Clean up provisioning scheduled tasks and their temp scripts/credentials.
+foreach ($tn in @("DC01-ADDSForest", "DC02-Join", "DC03-Join")) {
+    schtasks.exe /Delete /TN $tn /F 2>&1 | Out-Null
+}
+Remove-Item -Path "C:\Windows\Temp\DC*-*.ps1" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\dc01_addsforest.ps1" -Force -ErrorAction SilentlyContinue
+Write-Host "[harden] Provisioning scheduled tasks and temp scripts cleaned up"
+
 # Final verification: fail the provisioner if a usable vagrant account survived,
 # so 'finalize' does not silently seal an unhardened VM.
 if ($isDc) {

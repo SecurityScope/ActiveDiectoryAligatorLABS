@@ -61,15 +61,22 @@ try {
     $dsrmSec = ConvertTo-SecureString '__DSRM_PASS__' -AsPlainText -Force
     Install-ADDSForest -DomainName '__DOMAIN__' -SafeModeAdministratorPassword $dsrmSec -DomainNetbiosName '__DOMAIN_UPPER__' -InstallDns:$true -CreateDnsDelegation:$false -Force -Confirm:$false -NoRebootOnCompletion:$true -ErrorAction Stop *>&1 | Tee-Object -FilePath $log
     'ok' | Set-Content -Path $done -Encoding ASCII
+    schtasks.exe /Delete /TN "DC01-ADDSForest" /F 2>&1 | Out-Null
+    Remove-Item -LiteralPath "C:\Windows\Temp\dc01_addsforest.ps1" -Force -ErrorAction SilentlyContinue
     Restart-Computer -Force
 } catch {
     ($_ | Out-String) | Set-Content -Path $err -Encoding UTF8
     ('failed: ' + $_) | Add-Content -Path $log
     'failed' | Set-Content -Path $done -Encoding ASCII
+    schtasks.exe /Delete /TN "DC01-ADDSForest" /F 2>&1 | Out-Null
+    Remove-Item -LiteralPath "C:\Windows\Temp\dc01_addsforest.ps1" -Force -ErrorAction SilentlyContinue
     exit 1
 }
 '@
 
+$dsrmPass    = $dsrmPass -replace "'", "''"
+$domain      = $domain -replace "'", "''"
+$domainUpper = $domainUpper -replace "'", "''"
 $innerScript = $innerScript.Replace('__DSRM_PASS__', $dsrmPass).Replace('__DOMAIN__', $domain).Replace('__DOMAIN_UPPER__', $domainUpper)
 Set-Content -Path $innerScriptPath -Value $innerScript -Encoding UTF8
 
