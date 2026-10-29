@@ -134,7 +134,12 @@ end
 Vagrant.configure("2") do |config|
 
   config.vm.boot_timeout = 900
-  config.winrm.timeout   = 180
+  # WinRM's operation timeout must cover the longest silent provisioner step.
+  # AD DS promotion (Install-ADDSForest / Install-ADDSDomainController) runs for
+  # several minutes with no output; leaving this at 180s made Vagrant abort the
+  # session mid-promotion, after which setup.py force-reloaded the VM. Vagrant's
+  # own default is 1800s, which comfortably covers dc01_postboot's 900s wait.
+  config.winrm.timeout   = 1800
   config.winrm.retry_limit = 30
   config.winrm.retry_delay = 10
 
@@ -147,7 +152,7 @@ Vagrant.configure("2") do |config|
     trigger.name = "Create SECSCOPE.CORP NAT Network"
     if Vagrant::Util::Platform.windows?
       trigger.run = {
-        inline: 'cmd /c "\"C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe\" natnetwork add --netname SECSCOPE.CORP --network 192.168.200.0/24 --enable --dhcp off & exit 0"'
+        inline: '& "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" natnetwork add --netname SECSCOPE.CORP --network 192.168.200.0/24 --enable --dhcp off 2>$null; exit 0'
       }
     else
       trigger.run = {
@@ -250,13 +255,18 @@ Vagrant.configure("2") do |config|
 
     vm.vm.provision "base-reload", type: :reload
 
+    # Promotion replaces the local SAM and kills the WinRM session, so the real
+    # join script runs as a detached SYSTEM scheduled task (see run_detached.ps1).
     vm.vm.provision "join", type: "shell", run: "never",
-      path: "scripts/dc02_join.ps1", env: {
+      path: "scripts/run_detached.ps1", env: {
         "DOMAIN"       => DOMAIN,
         "DOMAIN_UPPER" => DOMAIN_UPPER,
         "ADMIN_PASS"   => ADMIN_PASS,
         "DC01_IP"      => DC01_IP,
-        "DC_IP"        => DC02_IP
+        "DC_IP"        => DC02_IP,
+        "LAB_SCRIPT"   => "C:\\vagrant\\scripts\\dc02_join.ps1",
+        "LAB_TASK"     => "DC02-Join",
+        "LAB_DONE"     => "C:\\Windows\\Temp\\dc02_join.done"
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"
@@ -286,14 +296,19 @@ Vagrant.configure("2") do |config|
 
     vm.vm.provision "base-reload", type: :reload
 
+    # Promotion replaces the local SAM and kills the WinRM session, so the real
+    # join script runs as a detached SYSTEM scheduled task (see run_detached.ps1).
     vm.vm.provision "join", type: "shell", run: "never",
-      path: "scripts/dc03_join.ps1", env: {
+      path: "scripts/run_detached.ps1", env: {
         "DOMAIN"       => DOMAIN,
         "DOMAIN_UPPER" => DOMAIN_UPPER,
         "CHILD_DOMAIN" => CHILD_DOMAIN,
         "ADMIN_PASS"   => ADMIN_PASS,
         "DC01_IP"      => DC01_IP,
-        "DC_IP"        => DC03_IP
+        "DC_IP"        => DC03_IP,
+        "LAB_SCRIPT"   => "C:\\vagrant\\scripts\\dc03_join.ps1",
+        "LAB_TASK"     => "DC03-Join",
+        "LAB_DONE"     => "C:\\Windows\\Temp\\dc03_join.done"
       }
 
     vm.vm.provision "join-reload", type: :reload, run: "never"

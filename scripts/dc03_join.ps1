@@ -28,7 +28,9 @@ if ($dcIP) {
         if ($curr -ne $dcIP) {
             Write-Host "[dc03_join] Internal adapter '$($intf.Name)' is '$curr'; setting static $dcIP"
             Get-NetIPAddress -InterfaceIndex $intf.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-            netsh interface ip set address name="$($intf.Name)" static $dcIP 255.255.255.0 192.168.200.1 | Out-Null
+            # No default gateway: the internal adapter must not outrank the NAT
+            # adapter's default route (WinRM rides the NAT adapter).
+            netsh interface ip set address name="$($intf.Name)" static $dcIP 255.255.255.0 | Out-Null
             Set-NetIPInterface -InterfaceIndex $intf.InterfaceIndex -Dhcp Disabled -ErrorAction SilentlyContinue
             Set-DnsClientServerAddress -InterfaceIndex $intf.InterfaceIndex -ServerAddresses $dc01IP -ErrorAction SilentlyContinue
             Start-Sleep 3

@@ -28,7 +28,9 @@ import os
 import re
 import sys
 import time
+import signal
 import select
+import hashlib
 import argparse
 import shutil
 import subprocess
@@ -72,6 +74,35 @@ DEPENDENCIES = {
 VBOX_NAME = {vm: f"{vm.upper()}.SECSCOPE.CORP" for vm in ALL_VMS}
 
 DEFAULT_MAX_PARALLEL = 2
+
+
+def _find_vboxmanage():
+    """Resolve the VBoxManage executable. On Windows VirtualBox does NOT add its
+    install directory to PATH, so fall back to the standard install locations."""
+    exe = shutil.which("VBoxManage")
+    if exe:
+        return exe
+    if os.name == "nt":
+        for p in (
+            r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe",
+            r"C:\Program Files (x86)\Oracle\VirtualBox\VBoxManage.exe",
+        ):
+            if Path(p).exists():
+                return p
+    return None
+
+
+VBOXMANAGE = _find_vboxmanage()
+
+
+def _sha256(path):
+    """Compute a file's SHA-256 digest in a memory-safe, cross-platform way."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(16 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colours / logging
@@ -235,6 +266,25 @@ WINRM_NOISE = re.compile(
 )
 
 
+def _kill_process_tree(proc):
+    """Kill `proc` and its children. On Windows `vagrant`/`packer` launch a
+    ruby child that inherits the stdout pipe; killing only the launcher leaves
+    the child holding the pipe and the caller blocked past its timeout."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=False):
     """Run a command. Returns (rc, stdout_text). Streams live unless capture."""
     full_env = os.environ.copy()
@@ -243,15 +293,28 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
 
     if capture:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, env=full_env, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, timeout=timeout,
+                stderr=subprocess.STDOUT, text=True,
             )
+        except FileNotFoundError:
+            raise LabError(f"Executable not found: {cmd[0]}")
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return 124, ""
+            _kill_process_tree(proc)
+            try:
+                stdout, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                stdout = ""
+            return 124, stdout or ""
         if check and proc.returncode != 0:
             raise LabError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
-        return proc.returncode, proc.stdout or ""
+        return proc.returncode, stdout or ""
 
     # Streaming mode (optionally filtering WinRM noise line-by-line).
     show_all = VERBOSE or DEBUG
@@ -271,35 +334,66 @@ def run(cmd, env=None, capture=False, check=False, timeout=None, filter_winrm=Fa
         if not QUIET:
             print(line, flush=True)
 
-    if os.name == "posix":
-        # Drain with process-exit awareness. Tools like packer spawn VirtualBox,
-        # which starts the long-lived VBoxSVC daemon; VBoxSVC can INHERIT this
-        # stdout pipe, so a plain `for line in proc.stdout` never sees EOF after
-        # packer exits and the build hangs forever between "box built" and the
-        # next step. Here, once the process has exited and the pipe is idle, we
-        # stop even if a grandchild still holds the write end open.
-        fd = proc.stdout.fileno()
-        while True:
-            rlist, _, _ = select.select([fd], [], [], 0.5)
-            if rlist:
-                line = proc.stdout.readline()
-                if line:
-                    _emit(line)
-                    continue
-                break  # empty read on a readable fd == genuine EOF
-            if proc.poll() is not None:
-                # Exited with nothing pending this tick; one short grace drain.
-                rlist, _, _ = select.select([fd], [], [], 0.2)
-                if not rlist:
-                    break
-    else:
-        for line in proc.stdout:
-            _emit(line)
+    # Streaming mode used to apply `timeout` only to proc.wait() AFTER the read
+    # loop, so a hung child (vagrant halt via WinRM, for example) could block
+    # indefinitely. Enforce the deadline with a watchdog that kills the tree.
+    timed_out = False
+    timer = None
+    if timeout is not None:
+        def _on_timeout():
+            nonlocal timed_out
+            timed_out = True
+            _kill_process_tree(proc)
+
+        timer = threading.Timer(timeout, _on_timeout)
+        timer.daemon = True
+        timer.start()
+
     try:
-        proc.stdout.close()
-    except Exception:
-        pass
-    proc.wait(timeout=timeout)
+        if os.name == "posix":
+            # Drain with process-exit awareness. Tools like packer spawn
+            # VirtualBox, which starts the long-lived VBoxSVC daemon; VBoxSVC
+            # can INHERIT this stdout pipe, so a plain `for line in proc.stdout`
+            # never sees EOF after packer exits and the build hangs forever
+            # between "box built" and the next step. Here, once the process has
+            # exited and the pipe is idle, we stop even if a grandchild still
+            # holds the write end open.
+            fd = proc.stdout.fileno()
+            while True:
+                rlist, _, _ = select.select([fd], [], [], 0.5)
+                if rlist:
+                    line = proc.stdout.readline()
+                    if line:
+                        _emit(line)
+                        continue
+                    break  # empty read on a readable fd == genuine EOF
+                if proc.poll() is not None:
+                    # Exited with nothing pending this tick; short grace drain.
+                    rlist, _, _ = select.select([fd], [], [], 0.2)
+                    if not rlist:
+                        break
+        else:
+            for line in proc.stdout:
+                _emit(line)
+    finally:
+        if timer is not None:
+            timer.cancel()
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=10 if timed_out else None)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+    if timed_out:
+        if check:
+            raise LabError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        return 124, ""
     if check and proc.returncode != 0:
         raise LabError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
     return proc.returncode, ""
@@ -323,7 +417,7 @@ def vagrant_winrm(vm, ps, password=None, timeout=120):
 
 
 def vbox(args, capture=True):
-    rc, out = run(["VBoxManage"] + args, capture=capture)
+    rc, out = run([VBOXMANAGE] + args, capture=capture)
     return rc, out
 
 
@@ -332,7 +426,11 @@ def vbox(args, capture=True):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def preflight():
-    missing = [t for t in ("vagrant", "VBoxManage") if shutil.which(t) is None]
+    missing = []
+    if shutil.which("vagrant") is None:
+        missing.append("vagrant")
+    if VBOXMANAGE is None:
+        missing.append("VBoxManage")
     if missing:
         raise LabError(
             f"Required tool(s) not found in PATH: {', '.join(missing)}. "
@@ -386,6 +484,225 @@ def vm_running(vm):
     return f'"{VBOX_NAME[vm]}"' in vbox_running_names()
 
 
+def _vm_dir(name):
+    """Default VirtualBox per-VM directory for a given VM name."""
+    return Path.home() / "VirtualBox VMs" / name
+
+
+def _vbox_inventory():
+    """Return ({name: uuid}, {running names}) parsed from VBoxManage."""
+    reg = {}
+    for line in vbox_vm_names().splitlines():
+        m = re.match(r'^"([^"]+)"\s+\{([0-9A-Fa-f-]+)\}', line.strip())
+        if m:
+            reg[m.group(1)] = m.group(2)
+    running = set()
+    for line in vbox_running_names().splitlines():
+        m = re.match(r'^"([^"]+)"', line.strip())
+        if m:
+            running.add(m.group(1))
+    return reg, running
+
+
+def _forget_vagrant_machine(vm, uuid):
+    """Drop Vagrant's recorded VM id for `vm` if it points at `uuid` (a stale,
+    half-created VM we just removed), so the next `up` starts from scratch."""
+    mdir = SCRIPT_DIR / ".vagrant" / "machines" / vm
+    idfile = mdir / "virtualbox" / "id"
+    try:
+        if idfile.exists() and idfile.read_text().strip().lower() == uuid.lower():
+            shutil.rmtree(mdir, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def purge_stale_vbox(vm):
+    """Remove VirtualBox leftovers that make the next `vagrant up` fail.
+
+    Two known failure modes (both hit on Windows after destroy/rebuild):
+      * `vagrant destroy` sometimes unregisters a VM but leaves its
+        '<...>\\VirtualBox VMs\\<NAME>' directory on disk (e.g. a saved-state
+        .sav). The Vagrantfile renames the new VM to <NAME>, so the rename
+        collides with VERR_ALREADY_EXISTS.
+      * A failed `up` can leave a half-created, temp-named VM
+        ('<project>_<vm>_<digits>_<digits>') registered in VirtualBox.
+
+    Only touches VMs/dirs that are NOT the live, registered target, so a
+    normal power-on of an existing VM is unaffected.
+    """
+    real = VBOX_NAME[vm]
+    reg, running = _vbox_inventory()
+
+    # 1) Stale directory for the real VM name (the VM itself is gone).
+    if real not in reg and real not in running:
+        d = _vm_dir(real)
+        if d.exists():
+            log_info(f"Removing stale VirtualBox directory: {d}")
+            shutil.rmtree(d, ignore_errors=True)
+
+    # 2) Orphaned temp-named VMs left by a previous failed `up`.
+    pat = re.compile(
+        rf"^{re.escape(SCRIPT_DIR.name)}_{re.escape(vm)}(?:_default)?_\d+_\d+$",
+        re.IGNORECASE)
+    for name, uuid in list(reg.items()):
+        if not pat.match(name) or name in running:
+            continue
+        log_info(f"Removing orphaned failed-build VM: {name}")
+        vbox(["unregistervm", name, "--delete"])
+        d = _vm_dir(name)
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+        _forget_vagrant_machine(vm, uuid)
+
+
+def _forget_vagrant_state(vm):
+    """Remove Vagrant's per-machine state dir (stale id / half-destroyed VM)."""
+    mdir = SCRIPT_DIR / ".vagrant" / "machines" / vm
+    if mdir.exists():
+        log_info(f"Removing stale Vagrant state: {mdir}")
+        shutil.rmtree(mdir, ignore_errors=True)
+
+
+def _clean_vbox_artifacts(vm):
+    """Purge stale VirtualBox leftovers + Vagrant state for one VM."""
+    purge_stale_vbox(vm)
+    _forget_vagrant_state(vm)
+
+
+def vagrant_up(vm, **kwargs):
+    """Purge stale VirtualBox artifacts, then `vagrant up <vm>`."""
+    purge_stale_vbox(vm)
+    kwargs.setdefault("filter_winrm", True)
+    kwargs.setdefault("check", True)
+    return vagrant(["up", vm], **kwargs)
+
+
+def _ad_cleanup_script(vm, is_dc, dry_run):
+    """PowerShell run on DC01 to remove stale AD/DNS metadata for `vm`.
+
+    Targets:
+      * DC server object in CN=Sites (and NTDS Settings/connections via -Recursive)
+      * domain computer object (any OU)
+      * A/other records named <vm> in every forward DNS zone
+      * SRV records whose target is <vm>.<domain>
+      * PTR records pointing at <vm>.<domain>
+    """
+    script = r'''
+$ErrorActionPreference = 'Continue'
+$vmName   = '__VM_NAME__'
+$domainDN = 'DC=secscope,DC=corp'
+$isDc     = __IS_DC__
+$dry      = __DRY__
+$site = 'Default-First-Site-Name'
+try { $site = (Get-ADDomainController -Identity 'DC01').Site } catch {}
+
+function Remove-LabObject([string]$dn, [string]$label) {
+    try {
+        $null = Get-ADObject -Identity $dn -ErrorAction Stop
+        if ($dry) { Write-Output "WOULD REMOVE $label $dn"; return }
+        try { Set-ADObject -Identity $dn -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue } catch {}
+        Remove-ADObject -Identity $dn -Recursive -Confirm:$false -ErrorAction Stop
+        Write-Output "REMOVED $label $dn"
+    } catch {
+        Write-Output "ABSENT $label $dn"
+    }
+}
+
+if ($isDc) {
+    Remove-LabObject "CN=$vmName,CN=Servers,CN=$site,CN=Sites,CN=Configuration,$domainDN" 'server'
+}
+
+try {
+    $comp = Get-ADComputer -Identity $vmName -ErrorAction Stop
+    Remove-LabObject $comp.DistinguishedName 'computer'
+} catch {
+    Write-Output "ABSENT computer CN=$vmName"
+}
+
+Import-Module DnsServer -ErrorAction SilentlyContinue
+foreach ($z in (Get-DnsServerZone -ErrorAction SilentlyContinue)) {
+    $zn = $z.ZoneName
+    if ($z.IsReverseLookupZone) {
+        Get-DnsServerResourceRecord -ZoneName $zn -RRType Ptr -ErrorAction SilentlyContinue | Where-Object {
+            $_.RecordData.PtrDomainName.ToString() -like "$vmName.*"
+        } | ForEach-Object {
+            if ($dry) { Write-Output "WOULD REMOVE PTR $zn $($_.HostName)" }
+            else {
+                Remove-DnsServerResourceRecord -ZoneName $zn -InputObject $_ -Force -ErrorAction SilentlyContinue
+                Write-Output "REMOVED PTR $zn $($_.HostName)"
+            }
+        }
+    } else {
+        Get-DnsServerResourceRecord -ZoneName $zn -Name $vmName -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($dry) { Write-Output "WOULD REMOVE record $zn $($_.HostName)" }
+            else {
+                Remove-DnsServerResourceRecord -ZoneName $zn -InputObject $_ -Force -ErrorAction SilentlyContinue
+                Write-Output "REMOVED record $zn $($_.HostName)"
+            }
+        }
+        Get-DnsServerResourceRecord -ZoneName $zn -RRType Srv -ErrorAction SilentlyContinue | Where-Object {
+            $_.RecordData.DomainName.ToString() -like "$vmName.*"
+        } | ForEach-Object {
+            if ($dry) { Write-Output "WOULD REMOVE SRV $zn $($_.HostName)" }
+            else {
+                Remove-DnsServerResourceRecord -ZoneName $zn -InputObject $_ -Force -ErrorAction SilentlyContinue
+                Write-Output "REMOVED SRV $zn $($_.HostName)"
+            }
+        }
+    }
+}
+Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+'''
+    return (script.replace('__VM_NAME__', vm.upper())
+                  .replace('__IS_DC__', '$true' if is_dc else '$false')
+                  .replace('__DRY__', '$true' if dry_run else '$false'))
+
+
+def _clean_ad_metadata(vm, dry_run=False):
+    """Remove stale AD computer/server objects + DNS records for `vm` on DC01.
+
+    Only valid once the VM is destroyed/absent. dc01 is the forest root and is
+    never cleaned here (that would destroy the forest). Returns True if the
+    cleanup ran (or was intentionally skipped for dc01), False if it could not
+    run (dc01 down/not a DC, or the target is still running).
+    """
+    if vm == "dc01":
+        log_skip("dc01 is the forest root - AD metadata cleanup skipped")
+        return True
+    if not vm_running("dc01"):
+        log_warn("dc01 is not running - cannot clean AD/DNS metadata")
+        return False
+    if vm_running(vm):
+        log_warn(f"{vm} is still running - refusing to remove live AD metadata "
+                 "(destroy it first)")
+        return False
+
+    # Pick the credential that is valid RIGHT NOW on dc01.
+    pw = ADMIN_PASS
+    rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot", password=pw, timeout=60)
+    if DOMAIN not in out:
+        pw = "vagrant"
+        rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot", password=pw, timeout=60)
+        if DOMAIN not in out:
+            log_warn("dc01 is not a reachable domain controller - skipping AD cleanup")
+            return False
+
+    log_info(f"Cleaning AD/DNS metadata for {vm} on dc01...")
+    ps = _ad_cleanup_script(vm, vm in DCS, dry_run)
+    with DC01_LOCK:
+        rc, out = vagrant_winrm("dc01", ps, password=pw, timeout=240)
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line:
+            log_info(f"  [ad] {line}")
+
+    if vm == "dc03" and not dry_run:
+        # The parent computer object is gone now, so the helper proceeds to
+        # remove the child-domain crossRef + NS delegation/forwarder.
+        clean_stale_child_domain(password=pw)
+    return True
+
+
 def vm_nic1(vm):
     """Return nic1 type ('nat'/'none'/...) or None if the VM is missing."""
     rc, out = vbox(["showvminfo", VBOX_NAME[vm], "--machinereadable"])
@@ -399,12 +716,25 @@ def vm_sealed(vm):
     return vm_nic1(vm) == "none"
 
 
-def _winrm_role(vm):
-    """DomainRole int via WinRM, trying vagrant then ADMIN_PASS. None if unreachable."""
-    for pw in ("vagrant", ADMIN_PASS):
+def _winrm_role(vm, password=None, timeout=60):
+    """DomainRole int via WinRM. None if unreachable.
+
+    If `password` is supplied, try ONLY that credential. Callers that know which
+    account is valid (dc02 after its join resets Administrator to ADMIN_PASS;
+    dc03 after its postboot does the same) must pass it: probing with the stale
+    password triggers Vagrant's full WinRM auth-retry loop (~60s each and can
+    lock the account), which is what made dc02 look stuck at
+    "Waiting for dc02 promotion".
+
+    `timeout` bounds each credential probe. A short timeout (20s) is used for
+    the initial "is this already a DC?" check after an interrupted build, where
+    one of the two passwords is known to be stale.
+    """
+    passwords = (password,) if password else ("vagrant", ADMIN_PASS)
+    for pw in passwords:
         rc, out = vagrant_winrm(
             vm, "(Get-CimInstance Win32_ComputerSystem).DomainRole",
-            password=pw, timeout=60)
+            password=pw, timeout=timeout)
         m = re.search(r"\b([0-5])\b", out)
         if m:
             return int(m.group(1))
@@ -440,9 +770,29 @@ def is_provisioned(vm):
         # and must NOT be treated as fully built, or the one-time guard would
         # skip the remaining DNS/objects steps.)
         rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot", password=ADMIN_PASS)
-        return DOMAIN in out
+        if DOMAIN not in out:
+            return False
+        # DNS resetting the password is not enough: the objects-base pipeline
+        # creates 'anakin' and the lab OUs. Without this check a build that
+        # stopped after DNS would be reported as "already built" and skipped.
+        # Use native `net user` rather than Get-ADUser: the AD-module cmdlet
+        # intermittently hung the WinRM shell (~60s timeout -> false negative),
+        # which made `status` and the dc02 dependency check treat this fully
+        # built DC01 as "not provisioned".
+        rc, out = vagrant_winrm("dc01", "net user anakin /domain 2>&1",
+                                password=ADMIN_PASS, timeout=60)
+        low = out.lower()
+        return "anakin" in low and "command completed successfully" in low
     if vm in ("dc02", "dc03"):
-        role = _winrm_role(vm)
+        # dc02_join.ps1 resets Administrator to ADMIN_PASS before returning;
+        # dc03 keeps 'vagrant' until dc03_postboot resets it. Try the expected
+        # credential first and only then the other, so a promoted dc02 is not
+        # probed with the stale 'vagrant' password (slow auth-retry storm).
+        preferred = ADMIN_PASS if vm == "dc02" else "vagrant"
+        role = _winrm_role(vm, password=preferred)
+        if role is None:
+            other = "vagrant" if preferred == ADMIN_PASS else ADMIN_PASS
+            role = _winrm_role(vm, password=other)
         return role is not None and role >= 4
     # member servers/workstations: must be domain-joined (role 1 workstation / 3
     # member server) AND carry the correct name - a box joined as VAGRANT-BUILD
@@ -533,8 +883,54 @@ Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
         vagrant_winrm("dc01", ps, password=ADMIN_PASS, timeout=180)
 
 
-def clean_stale_child_domain():
+def _clean_stale_dc_parent(vm):
+    """Remove a previous incarnation's parent-domain DC server/computer/DNS
+    objects before `vm` is promoted again.
+
+    Safe only while `vm` is NOT a DC (after sysprep it is a standalone box).
+    This closes the gap left by dc02_join/dc03_join: they remove the computer
+    object but not the parent server object under CN=Sites, which can block
+    Install-ADDSDomainController / Install-ADDSDomain on a rebuild.
+    """
+    if vm not in ("dc02", "dc03"):
+        return
+    role = _winrm_role(vm, password="vagrant")
+    if role is None:
+        log_warn(f"{vm}: WinRM unreachable - skipping pre-promotion AD cleanup")
+        return
+    if role >= 4:
+        log_skip(f"{vm} is already a DC (role {role}) - skipping pre-promotion cleanup")
+        return
+    if not vm_running("dc01"):
+        log_warn("dc01 is not running - skipping pre-promotion AD cleanup")
+        return
+
+    # Pick the credential that is valid RIGHT NOW on dc01.
+    pw = ADMIN_PASS
+    rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot", password=pw, timeout=60)
+    if DOMAIN not in out:
+        pw = "vagrant"
+        rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot", password=pw, timeout=60)
+        if DOMAIN not in out:
+            log_warn("dc01 is not a reachable domain controller - "
+                     "skipping pre-promotion AD cleanup")
+            return
+
+    log_info(f"Removing stale parent-domain AD objects for {vm} before promotion...")
+    ps = _ad_cleanup_script(vm, True, False)
+    with DC01_LOCK:
+        rc, out = vagrant_winrm("dc01", ps, password=pw, timeout=240)
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("REMOVED"):
+            log_info(f"  [ad] {line}")
+        elif line.startswith("ABSENT"):
+            log_verbose(f"    [ad] {line}")
+
+
+def clean_stale_child_domain(password=None):
     log_info("Cleaning stale child-domain metadata on DC01 (for DC03 rebuild)...")
+    password = password or ADMIN_PASS
     ps = r'''
 $childDN = "DC=it,DC=secscope,DC=corp"
 $partitionsDN = "CN=Partitions,CN=Configuration,DC=secscope,DC=corp"
@@ -558,7 +954,7 @@ if ($dc03Present) {
 }
 '''
     with DC01_LOCK:
-        vagrant_winrm("dc01", ps, password=ADMIN_PASS, timeout=180)
+        vagrant_winrm("dc01", ps, password=password, timeout=180)
 
 
 def wait_forest_replication(timeout=300):
@@ -610,11 +1006,37 @@ def provision(vm, name, password=None, timeout=None, extra_env=None):
 def wait_for_role(vm, wanted_roles, attempts=48, delay=5, password=None):
     for i in range(1, attempts + 1):
         time.sleep(delay)
-        role = _winrm_role(vm)
+        # Pass the caller's known-good credential straight through. Without this
+        # a promoted dc02 (password already ADMIN_PASS) was probed with stale
+        # 'vagrant' first, burning the full WinRM auth-retry timeout every loop.
+        role = _winrm_role(vm, password=password)
         if role in wanted_roles:
             log_ok(f"{vm} ready (role {role}) after {i*delay}s")
             return True
         log_verbose(f"    {vm} attempt {i}/{attempts} (role={role})")
+    return False
+
+
+def wait_winrm_stable(vm, password=None, timeout=180, delay=5):
+    """Wait until WinRM answers two consecutive short commands.
+
+    AD DS promotion/finalization briefly restarts services; the first few WinRM
+    calls after AD answers can still hang (this is what made the first dc01
+    'dns' run sit for 30 minutes). Requiring two successes means the next long
+    provisioner starts against a settled WinRM stack.
+    """
+    deadline = time.time() + timeout
+    streak = 0
+    while time.time() < deadline:
+        rc, out = vagrant_winrm(vm, "hostname", password=password, timeout=30)
+        if rc == 0 and out.strip():
+            streak += 1
+            if streak >= 2:
+                log_verbose(f"    {vm} WinRM stable")
+                return True
+        else:
+            streak = 0
+        time.sleep(delay)
     return False
 
 
@@ -631,37 +1053,62 @@ def sysprep_vm(vm):
     if vm in MEMBERS and role in (1, 3):
         log_skip(f"{vm} already domain-joined (role {role}); skipping sysprep")
         return
-    log_info(f"Sysprep (new SID) on {vm}...")
-    provision(vm, "sysprep")
-    # sysprep /generalize /oobe /reboot runs ASYNCHRONOUSLY and reboots the VM on
-    # its own schedule, OUTSIDE Vagrant's control. The generalize + specialize +
-    # OOBE cycle never completes in under ~90s. The old "poll WinRM until it
-    # drops, then until it returns" logic raced that cycle: a transient WinRM blip
-    # during generalize was misread as "sysprep finished", so the next reload
-    # fired WHILE generalize was still running - interrupting it and corrupting
-    # the image (every subsequent boot then times out). Instead: give sysprep a
-    # mandatory settle window, THEN wait for the post-OOBE FirstLogonCommands to
-    # bring WinRM back, requiring two consecutive successes so we never latch onto
-    # a half-up pre-reboot session.
-    SETTLE = 90
-    log_info(f"Waiting {SETTLE}s for {vm} to generalize + reboot into OOBE...")
-    time.sleep(SETTLE)
-    online = False
-    streak = 0
-    for i in range(1, 41):  # ~ up to SETTLE + several minutes
-        rc, _ = vagrant(["winrm", vm, "-c", "exit 0"], capture=True, timeout=30)
-        if rc == 0:
-            streak += 1
-            if streak >= 2:
-                log_ok(f"{vm} back online after sysprep (~{SETTLE + i*10}s)")
-                online = True
-                break
-        else:
+    # sysprep_sid.ps1's FirstLogonCommands writes this marker after OOBE
+    # completes. If it exists, generalize already ran - re-running sysprep would
+    # fail ("Sysprep was not able to validate...") or waste another OOBE cycle.
+    rc, marker = vagrant_winrm(
+        vm, "Test-Path C:\\Windows\\Temp\\lab_sysprep.done",
+        password="vagrant", timeout=30)
+    already_sysprepped = "True" in marker
+    if already_sysprepped:
+        log_skip(f"{vm} already sysprepped (lab_sysprep.done present) - "
+                 "skipping sysprep, re-applying base config")
+
+    if not already_sysprepped:
+        log_info(f"Sysprep (new SID) on {vm}...")
+        provision(vm, "sysprep")
+        # sysprep /generalize /oobe /reboot runs ASYNCHRONOUSLY and reboots the VM
+        # on its own schedule, OUTSIDE Vagrant's control. The generalize +
+        # specialize + OOBE cycle never completes in under ~90s. Give sysprep a
+        # mandatory settle window, THEN wait for the post-OOBE FirstLogonCommands
+        # to bring WinRM back, requiring two consecutive successes so we never
+        # latch onto a half-up pre-reboot session.
+        SETTLE = 90
+        log_info(f"Waiting {SETTLE}s for {vm} to generalize + reboot into OOBE...")
+        time.sleep(SETTLE)
+        online = False
+        streak = 0
+        for i in range(1, 41):  # ~ up to SETTLE + several minutes
+            rc, _ = vagrant(["winrm", vm, "-c", "exit 0"], capture=True, timeout=30)
+            if rc == 0:
+                streak += 1
+                if streak >= 2:
+                    log_ok(f"{vm} back online after sysprep (~{SETTLE + i*10}s)")
+                    online = True
+                    break
+            else:
+                streak = 0
+            time.sleep(10)
+            log_verbose(f"    {vm} post-sysprep wait {i}/40 (streak={streak})...")
+        if not online:
+            # OOBE can sit forever on a black screen after a host sleep/pause
+            # (observed on dc02, 2026-10-27). One reset resumed it in ~60s.
+            log_warn(f"{vm} did not come back after sysprep; resetting once and retrying...")
+            vbox(["controlvm", VBOX_NAME[vm], "reset"])
             streak = 0
-        time.sleep(10)
-        log_verbose(f"    {vm} post-sysprep wait {i}/40 (streak={streak})...")
-    if not online:
-        raise LabError(f"{vm} did not come back after sysprep")
+            for i in range(1, 21):
+                rc, _ = vagrant(["winrm", vm, "-c", "exit 0"], capture=True, timeout=30)
+                if rc == 0:
+                    streak += 1
+                    if streak >= 2:
+                        log_ok(f"{vm} back online after reset (~{i*10}s)")
+                        online = True
+                        break
+                else:
+                    streak = 0
+                time.sleep(10)
+        if not online:
+            raise LabError(f"{vm} did not come back after sysprep/reset")
     log_info(f"Reloading {vm} to stabilize...")
     reload_vm(vm)
     if vm not in MEMBERS:
@@ -706,49 +1153,104 @@ def _dc01_dns_done():
     return "secscope" in out
 
 
+def _dc01_promotion_diagnostics():
+    """Best-effort tail of the detached promotion logs when the AD poll fails."""
+    ps = ("Get-Content C:\\Windows\\Temp\\dc01_addsforest.err.log,"
+          "C:\\Windows\\Temp\\dc01_addsforest.out.log -Tail 25 "
+          "-ErrorAction SilentlyContinue")
+    for pw in ("vagrant", ADMIN_PASS):
+        rc, out = vagrant_winrm("dc01", ps, password=pw, timeout=60)
+        if out and out.strip():
+            log_warn("Promotion log tail:")
+            for line in out.strip().splitlines()[-30:]:
+                log_warn(f"  {line}")
+            return
+    log_warn("No promotion logs found "
+             "(C:\\Windows\\Temp\\dc01_addsforest.{out,err}.log)")
+
+
 def build_dc01():
     log_step("[dc01] Base boot + AD DS forest promotion")
     if not vm_running("dc01"):
-        vagrant(["up", "dc01"], filter_winrm=True, check=True)
+        vagrant_up("dc01")
 
     # Idempotent resume: skip promotion if DC01 is already a domain controller
     # (e.g. an earlier run was interrupted after promotion but before DNS).
     if _dc01_is_promoted():
         log_skip("DC01 already promoted; resuming at post-promotion steps")
     else:
-        log_info("Promoting DC01 to forest root (WinRM errors during promotion are expected)...")
-        provision("dc01", "postboot")
-        log_info("Rebooting DC01 to finalize promotion...")
-        reload_vm("dc01")
+        log_info("Promoting DC01 to forest root (detached task; WinRM drops while the local SAM is replaced)...")
+        rc = provision("dc01", "postboot")
+        if rc != 0:
+            log_warn(f"postboot returned {rc} - the promotion task may not have "
+                     "started (see the postboot output above); waiting for AD anyway")
 
-        log_info("Polling for AD to initialize (up to 240s)...")
+        # The promotion runs as a SYSTEM scheduled task and reboots the guest
+        # itself. Do NOT reload here: a reload while Install-ADDSForest is still
+        # running leaves a half-promoted DC that never boots cleanly. Wait for
+        # the automatic reboot and for AD to answer.
+        log_info("Waiting for DC01 promotion + automatic reboot (up to 20 minutes)...")
         ready = False
-        for i in range(1, 49):
-            time.sleep(5)
-            rc, out = vagrant_winrm("dc01", "Get-ADDomain", password="vagrant", timeout=60)
+        deadline = time.time() + 1200
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            rc, out = vagrant_winrm("dc01", "(Get-ADDomain).DNSRoot",
+                                    password="vagrant", timeout=60)
             if "secscope" in out:
-                log_ok(f"AD ready after {i*5}s")
+                log_ok(f"AD ready after ~{attempt * 10}s")
                 ready = True
                 break
-            log_verbose(f"    ... attempt {i}/48")
+            if attempt % 6 == 0:
+                # A hard task failure is recorded in the .done marker; stop
+                # early instead of burning the full 20-minute deadline.
+                mrc, marker = vagrant_winrm(
+                    "dc01",
+                    "Get-Content C:\\Windows\\Temp\\dc01_addsforest.done "
+                    "-ErrorAction SilentlyContinue",
+                    password="vagrant", timeout=30)
+                if "failed" in marker:
+                    _dc01_promotion_diagnostics()
+                    raise LabError("DC01 promotion task failed (see log above)")
+                log_verbose(f"    ... waiting for AD ({attempt}) rc={rc}")
+            time.sleep(10)
         if not ready:
-            raise LabError("DC01 AD did not initialize within 240s")
+            _dc01_promotion_diagnostics()
+            raise LabError("DC01 AD did not initialize within 20 minutes")
 
     # The Administrator password is still 'vagrant' until the 'dns' provisioner
     # runs. If DNS already ran (resumed build), it is ADMIN_PASS. Pick whichever
     # is valid now so ensure_adws / NLA don't hit a WinRM auth-retry storm.
     current_pw = ADMIN_PASS if _dc01_dns_done() else "vagrant"
+    if not wait_winrm_stable("dc01", password=current_pw):
+        log_warn("DC01 WinRM still unstable after promotion; continuing anyway")
     vagrant_winrm("dc01", "Restart-Service NlaSvc -Force; Start-Sleep 5",
                   password=current_pw)
     ensure_adws("dc01", password=current_pw)
 
     log_step("[dc01] DNS configuration")
-    provision("dc01", "dns", password=current_pw)  # resets Administrator -> ADMIN_PASS
+    for attempt in (1, 2, 3):
+        pw = ADMIN_PASS if _dc01_dns_done() else "vagrant"
+        rc = provision("dc01", "dns", password=pw)  # resets Administrator -> ADMIN_PASS
+        if rc == 0:
+            break
+        log_warn(f"dns provisioner failed (rc={rc}); retrying ({attempt}/3) "
+                 "after WinRM settles...")
+        wait_winrm_stable("dc01", password=pw, timeout=240)
+    else:
+        raise LabError("dc01 dns provisioner failed after 3 attempts")
     log_info("Cleaning stale NAT DNS records...")
     clean_nat_leak()
 
     log_step("[dc01] AD objects - base (users, groups, OUs)")
-    provision("dc01", "objects-base", password=ADMIN_PASS)
+    for attempt in (1, 2, 3):
+        rc = provision("dc01", "objects-base", password=ADMIN_PASS)
+        if rc == 0:
+            break
+        log_warn(f"objects-base provisioner failed (rc={rc}); retrying ({attempt}/3)...")
+        wait_winrm_stable("dc01", password=ADMIN_PASS)
+    else:
+        raise LabError("dc01 objects-base provisioner failed after 3 attempts")
 
     if DISABLE_AV_UPDATE:
         log_step("[dc01] AV/Update disable GPO (--disable-av-update)")
@@ -760,14 +1262,17 @@ def _dc_secondary(vm):
     """dc02 / dc03 shared pipeline."""
     log_step(f"[{vm}] Boot")
     if not vm_running(vm):
-        vagrant(["up", vm], filter_winrm=True, check=True)
+        vagrant_up(vm)
 
     # Idempotent resume: if the VM is already a domain controller (role >= 4),
     # an earlier run got past promotion - skip sysprep/base/join and go straight
     # to the post-promotion configuration. _winrm_role() already tries both the
     # 'vagrant' and ADMIN_PASS credentials, so a promoted dc03 (whose child-
     # domain Administrator may still be 'vagrant') is detected too.
-    role = _winrm_role(vm)
+    # Short probes: on a resumed dc02/dc03 the Administrator password may already
+    # be ADMIN_PASS while the stale 'vagrant' credential is tried first. A 20s
+    # bound keeps that from looking like a hang.
+    role = _winrm_role(vm, timeout=20)
     already_dc = role is not None and role >= 4
     if already_dc:
         log_skip(f"{vm} already promoted; resuming at post-promotion steps")
@@ -779,7 +1284,15 @@ def _dc_secondary(vm):
         # and severs WinRM (KeepAliveDisconnected -> boot timeout).
         sysprep_vm(vm)
 
+        # Remove the previous incarnation's parent DC server/computer/DNS
+        # objects before promoting. dc02_join/dc03_join only remove the computer
+        # object; the orphaned CN=<VM>,CN=Servers object can make
+        # Install-ADDSDomainController / Install-ADDSDomain fail on a rebuild.
+        _clean_stale_dc_parent(vm)
+
         if vm == "dc03":
+            # Now that the parent DC03 computer object is gone, this also cleans
+            # the child-domain crossRef + NS delegation/forwarder.
             clean_stale_child_domain()
             # The child domain's uniqueness check reads the forest config/GC via
             # DC01; if DC01<->DC02 haven't converged yet the create aborts. Gate
@@ -787,21 +1300,34 @@ def _dc_secondary(vm):
             wait_forest_replication()
 
         log_step(f"[{vm}] Domain-controller promotion")
-        provision(vm, "join")
+        rc = provision(vm, "join")
+        if rc != 0:
+            log_warn(f"{vm} join wrapper returned {rc}; the detached task may "
+                     "not have started (see the join output above)")
         # dc03 promotes a NEW child domain whose Administrator is still 'vagrant'
         # until dc03_postboot resets it; dc02 joins the existing domain (ADMIN_PASS).
         reload_pw = "vagrant" if vm == "dc03" else ADMIN_PASS
-        reload_vm(vm, password=reload_pw)
-
-        if not wait_for_role(vm, (4, 5), password=reload_pw):
-            raise LabError(f"{vm} did not become a domain controller within 240s")
+        # The join script runs as a SYSTEM scheduled task and reboots the guest
+        # after promotion (WinRM auth is lost when the local SAM is replaced).
+        # Reloading here would kill the promotion mid-flight.
+        log_info(f"Waiting for {vm} promotion + automatic reboot (up to 25 minutes)...")
+        if not wait_for_role(vm, (4, 5), attempts=120, delay=10, password=reload_pw):
+            raise LabError(f"{vm} did not become a domain controller within ~25 minutes")
+        wait_winrm_stable(vm, password=reload_pw)
         vagrant_winrm(vm, "Restart-Service NlaSvc -Force; Start-Sleep 5", password=reload_pw)
         ensure_adws(vm, password=reload_pw)
 
     log_step(f"[{vm}] Post-promotion configuration")
     if vm == "dc03":
-        rc = provision(vm, "postboot", password="vagrant")
-        if rc != 0:
+        # Fresh dc03: Administrator is still 'vagrant' until dc03_postboot
+        # resets it. Resumed dc03 (postboot already ran): ADMIN_PASS. Probe
+        # quickly so we don't launch a long wrong-password WinRM retry storm.
+        postboot_pw = "vagrant"
+        rc, out = vagrant_winrm(vm, "hostname", password=postboot_pw, timeout=20)
+        if not (out or "").strip():
+            postboot_pw = ADMIN_PASS
+        rc = provision(vm, "postboot", password=postboot_pw)
+        if rc != 0 and postboot_pw != ADMIN_PASS:
             provision(vm, "postboot", password=ADMIN_PASS)
     else:
         provision(vm, "postboot", password=ADMIN_PASS)
@@ -838,7 +1364,7 @@ def build_dc03():
 def _member_join(vm):
     log_step(f"[{vm}] Boot")
     if not vm_running(vm):
-        vagrant(["up", vm], filter_winrm=True, check=True)
+        vagrant_up(vm)
     log_step(f"[{vm}] Sysprep")
     sysprep_vm(vm)
     log_info("Pre-join NAT DNS cleanup on DC01...")
@@ -894,7 +1420,7 @@ def build_ws02():
 def build_lin01():
     log_step("[lin01] Boot + SSSD domain join")
     if not vm_running("lin01"):
-        vagrant(["up", "lin01"], filter_winrm=True, check=True)
+        vagrant_up("lin01")
     else:
         provision("lin01", "setup")
     log_ok("LIN01 build complete")
@@ -979,7 +1505,7 @@ def resolve_targets(targets):
 
 
 def cmd_build(targets, force=False, parallel=False, max_parallel=DEFAULT_MAX_PARALLEL,
-              rebuild=False):
+              rebuild=False, clean=False):
     preflight()
     requested = resolve_targets(targets)
     order = _build_order(requested)  # includes dependencies for ordering
@@ -1002,6 +1528,11 @@ def cmd_build(targets, force=False, parallel=False, max_parallel=DEFAULT_MAX_PAR
         if rebuild or (already and force):
             log_info(f"Rebuilding {vm}: destroying first...")
             vagrant(["destroy", "-f", vm], filter_winrm=True)
+            _clean_vbox_artifacts(vm)
+            if clean:
+                # Must run after destroy: it refuses to touch a live VM's AD
+                # metadata. dc01 is skipped internally (forest root).
+                _clean_ad_metadata(vm)
         # Dependencies must be satisfied at build time.
         check_dependencies(vm)
         BUILDERS[vm]()
@@ -1097,7 +1628,7 @@ def cmd_harden(targets, force=False):
             log_skip(f"{vm} not running")
             continue
         log_info(f"Hardening {vm}...")
-        rc = provision(vm, "harden", password=_harden_password(vm))
+        rc = provision(vm, "harden", password=_harden_password(vm), timeout=900)
         if rc == 0:
             log_ok(f"{vm} hardened")
         else:
@@ -1131,21 +1662,44 @@ def _verify_internal_ip(vm):
     return False
 
 
-def _seal_vm(vm):
-    """Halt -> poweroff -> remove NAT nic1 -> restart headless, single-homed on
-    192.168.200.x. Returns the modifyvm rc (0 on success). Caller verifies the
-    internal IP first (WinRM is gone after harden)."""
+def _shutdown_vm(vm, shutdown_timeout=120, no_graceful=False):
+    """Stop a running VM: local ACPI power-button (bounded) then poweroff.
+
+    Do NOT use `vagrant halt` here: it rides WinRM, which harden may already have
+    disabled, and Vagrant's own timeout is 1800s. VBoxManage local ACPI is
+    bounded and works after harden.
+    """
+    if not vm_running(vm):
+        return True
     name = VBOX_NAME[vm]
-    # Graceful halt (bounded), then hard poweroff so modifyvm can proceed.
-    log_info(f"Halting {vm}...")
-    vagrant(["halt", vm], filter_winrm=True, timeout=60)
+    if not no_graceful:
+        log_info(f"Requesting graceful shutdown of {vm} "
+                 f"(up to {shutdown_timeout}s)...")
+        vbox(["controlvm", name, "acpipowerbutton"])
+        deadline = time.time() + shutdown_timeout
+        while time.time() < deadline:
+            if not vm_running(vm):
+                return True
+            time.sleep(2)
     if vm_running(vm):
         log_info(f"{vm} still running - forcing poweroff...")
         vbox(["controlvm", name, "poweroff"])
-    for _ in range(15):
-        if not vm_running(vm):
-            break
-        time.sleep(2)
+        for _ in range(30):
+            if not vm_running(vm):
+                return True
+            time.sleep(2)
+    return not vm_running(vm)
+
+
+def _seal_vm(vm, shutdown_timeout=120, no_graceful=False):
+    """Graceful ACPI stop (bounded) -> poweroff fallback -> remove NAT nic1 ->
+    restart headless, single-homed on 192.168.200.x. Returns the modifyvm rc.
+    Caller verifies the internal IP first (WinRM is gone after harden)."""
+    name = VBOX_NAME[vm]
+    if not _shutdown_vm(vm, shutdown_timeout=shutdown_timeout,
+                        no_graceful=no_graceful):
+        log_warn(f"{vm} could not be powered off - cannot modify nic1")
+        return 1
     log_info(f"Removing nic1 (NAT) from {name}...")
     rc, _ = vbox(["modifyvm", name, "--nic1", "none"])
     if rc != 0:
@@ -1156,7 +1710,7 @@ def _seal_vm(vm):
     return 0
 
 
-def cmd_seal(targets, force=False):
+def cmd_seal(targets, force=False, shutdown_timeout=120, no_graceful=False):
     preflight()
     vms = resolve_targets(targets)
     if not confirm("seal (remove NAT nic1, sever management of)", vms, force):
@@ -1164,6 +1718,8 @@ def cmd_seal(targets, force=False):
     banner("Seal network - remove NAT nic1 (single-homed)")
     log_warn("This removes Vagrant/WinRM/RDP access. Reach VMs via the VirtualBox")
     log_warn("console or an in-network host (Kali .99) afterwards.")
+    log_warn("NOTE: seal does NOT remove the vagrant account - use 'harden' or")
+    log_warn("'finalize' for that (always before sealing).")
     sealed, failures = 0, 0
     for vm in vms:
         if not vm_exists(vm):
@@ -1173,7 +1729,8 @@ def cmd_seal(targets, force=False):
             log_skip(f"{vm} already sealed")
             continue
         _verify_internal_ip(vm)
-        if _seal_vm(vm) != 0:
+        if _seal_vm(vm, shutdown_timeout=shutdown_timeout,
+                    no_graceful=no_graceful) != 0:
             failures += 1
             continue
         sealed += 1
@@ -1182,7 +1739,8 @@ def cmd_seal(targets, force=False):
     return 0 if failures == 0 else 1
 
 
-def cmd_finalize(targets, force=False, dns_clean=True):
+def cmd_finalize(targets, force=False, dns_clean=True, shutdown_timeout=120,
+                 no_graceful=False):
     """End-of-build lockdown: verify internal IPs -> clean NAT-leak DNS ->
     harden (delete vagrant creds) -> seal (remove NAT nic1). Produces a lab that
     works on 192.168.200.x only. Ordering matters: harden needs WinRM/SSH, which
@@ -1228,6 +1786,7 @@ def cmd_finalize(targets, force=False, dns_clean=True):
     # 3) Harden each running VM (deletes vagrant creds; disables WinRM basic auth).
     hardened = 0
     harden_warn = 0
+    harden_failed = set()
     for vm in ordered:
         if not vm_running(vm):
             log_skip(f"{vm} not running - skipping harden")
@@ -1236,26 +1795,32 @@ def cmd_finalize(targets, force=False, dns_clean=True):
         # DCs authenticate as Administrator/ADMIN_PASS (no local vagrant account);
         # members + lin01 keep vagrant/vagrant. Wrong creds here = a long WinRM
         # auth-retry storm AND a VM left with WinRM basic auth still enabled.
-        rc = provision(vm, "harden", password=_harden_password(vm))
+        rc = provision(vm, "harden", password=_harden_password(vm), timeout=900)
         if rc == 0:
             log_ok(f"{vm} hardened")
             hardened += 1
         else:
-            log_warn(f"{vm} harden returned {rc} - WinRM/SSH auth likely failed; "
-                     "vagrant creds may NOT be removed")
+            log_warn(f"{vm} harden returned {rc} - vagrant creds may NOT be removed")
             harden_warn += 1
+            harden_failed.add(vm)
 
     # 4) Seal each VM (remove NAT nic1). IPs were verified in step 1; WinRM is now
-    #    gone, so _seal_vm does not re-probe.
+    #    gone, so _seal_vm does not re-probe. Never seal a VM whose harden failed:
+    #    that would sever management while leaving the vagrant account behind.
     sealed, failures = 0, 0
     for vm in ordered:
         if not vm_exists(vm):
             log_skip(f"{vm} not created")
             continue
+        if vm in harden_failed:
+            log_warn(f"{vm} NOT sealed - harden failed (vagrant creds may remain)")
+            failures += 1
+            continue
         if vm_sealed(vm):
             log_skip(f"{vm} already sealed")
             continue
-        if _seal_vm(vm) != 0:
+        if _seal_vm(vm, shutdown_timeout=shutdown_timeout,
+                    no_graceful=no_graceful) != 0:
             failures += 1
             continue
         sealed += 1
@@ -1267,7 +1832,7 @@ def cmd_finalize(targets, force=False, dns_clean=True):
     return 0 if (failures == 0 and harden_warn == 0) else 1
 
 
-def cmd_unseal(targets):
+def cmd_unseal(targets, shutdown_timeout=120, no_graceful=False):
     preflight()
     vms = resolve_targets(targets)
     banner("Unseal network - restore NAT nic1")
@@ -1279,16 +1844,17 @@ def cmd_unseal(targets):
         if not vm_sealed(vm):
             log_skip(f"{vm} not sealed")
             continue
-        if vm_running(vm):
-            vbox(["controlvm", name, "poweroff"])
-            time.sleep(5)
+        if not _shutdown_vm(vm, shutdown_timeout=shutdown_timeout,
+                            no_graceful=no_graceful):
+            log_warn(f"{vm} could not be powered off - cannot restore nic1")
+            continue
         vbox(["modifyvm", name, "--nic1", "nat"])
         log_ok(f"{vm} NAT nic1 restored")
         vbox(["startvm", name, "--type", "headless"])
     return 0
 
 
-def cmd_destroy(targets, force=False):
+def cmd_destroy(targets, force=False, clean=False):
     preflight()
     is_all = bool(targets) and len(targets) == 1 and targets[0].lower() == "all"
     vms = list(ALL_VMS) if is_all else resolve_targets(targets)
@@ -1297,20 +1863,89 @@ def cmd_destroy(targets, force=False):
     if is_all:
         log_info("Destroying all VMs...")
         vagrant(["destroy", "-f"], filter_winrm=True)
+        for vm in ALL_VMS:
+            _clean_vbox_artifacts(vm)
+        if clean:
+            log_warn("All VMs destroyed - AD metadata cleanup skipped (forest gone)")
         log_ok("All VMs destroyed")
         return 0
-    for vm in vms:
+    # dc01 last: while it is up, the other VMs' stale AD/DNS metadata can be
+    # removed; after dc01 is destroyed there is no domain left to clean.
+    ordered = [v for v in vms if v != "dc01"] + (["dc01"] if "dc01" in vms else [])
+    for vm in ordered:
         log_info(f"Destroying {vm}...")
         vagrant(["destroy", "-f", vm], filter_winrm=True)
+        _clean_vbox_artifacts(vm)
+        if clean:
+            _clean_ad_metadata(vm)
     log_ok("Destroy complete")
+    return 0
+
+
+def cmd_clean(targets, force=False, dry_run=False, vbox_only=False, ad_only=False,
+              keep_vm=False):
+    """Destroy VM(s) and/or purge everything that blocks a clean rebuild:
+    VirtualBox leftovers, Vagrant state, stale AD server/computer objects and
+    DNS records."""
+    preflight()
+    vms = resolve_targets(targets)
+    banner("Clean - rebuild artifacts + AD/DNS metadata")
+    if not dry_run and not confirm(
+            "clean (destroy VM + purge artifacts + remove AD/DNS metadata for)",
+            vms, force):
+        return 1
+
+    # dc01 last so the other VMs' metadata can be cleaned while the domain is up.
+    ordered = [v for v in vms if v != "dc01"] + (["dc01"] if "dc01" in vms else [])
+    destroyed, ad_cleaned = [], []
+    for vm in ordered:
+        log_step(f"[{vm}] Clean")
+        running = vm_running(vm)
+        exists = vm_exists(vm)
+
+        if not ad_only:
+            if exists or running:
+                if keep_vm:
+                    log_warn(f"{vm} still exists - --keep-vm set, not destroying")
+                elif dry_run:
+                    log_info(f"(dry-run) would destroy {vm} "
+                             f"({'running' if running else 'poweroff'})")
+                else:
+                    log_info(f"Destroying {vm}...")
+                    vagrant(["destroy", "-f", vm], filter_winrm=True)
+                    destroyed.append(vm)
+            if dry_run:
+                log_info(f"(dry-run) would purge VirtualBox/Vagrant artifacts for {vm}")
+            else:
+                _clean_vbox_artifacts(vm)
+
+        if not vbox_only:
+            if dry_run:
+                if running and not keep_vm and not ad_only:
+                    log_info(f"(dry-run) would remove AD/DNS metadata for {vm} "
+                             "after destroying it")
+                else:
+                    _clean_ad_metadata(vm, dry_run=True)
+            elif vm == "dc01":
+                _clean_ad_metadata(vm)          # logs the forest-root skip
+            elif running:
+                log_warn(f"{vm} is still running - skipping AD metadata cleanup "
+                         "(destroy it first, or omit --keep-vm)")
+            elif _clean_ad_metadata(vm):
+                ad_cleaned.append(vm)
+
+    log("")
+    log_ok(f"Clean complete - destroyed: {', '.join(destroyed) or 'none'}; "
+           f"AD cleaned: {', '.join(ad_cleaned) or 'none'}")
     return 0
 
 
 def cmd_build_boxes(opts):
     preflight()
-    if shutil.which("packer") is None and (SCRIPT_DIR / "bin" / "packer").exists():
-        os.environ["PATH"] = f"{SCRIPT_DIR / 'bin'}:{os.environ['PATH']}"
-    for tool in ("packer", "vagrant", "VBoxManage", "sha256sum"):
+    packer_exe = "packer.exe" if os.name == "nt" else "packer"
+    if shutil.which("packer") is None and (SCRIPT_DIR / "bin" / packer_exe).exists():
+        os.environ["PATH"] = f"{SCRIPT_DIR / 'bin'}{os.pathsep}{os.environ['PATH']}"
+    for tool in ("packer", "vagrant"):
         if shutil.which(tool) is None:
             raise LabError(f"{tool} not found in PATH")
     banner("AD Alligator Labs - Build Packer Boxes")
@@ -1335,8 +1970,7 @@ def cmd_build_boxes(opts):
         if not Path(iso).exists():
             raise LabError(f"ISO not found: {iso}")
         log_info(f"Building {name} (ISO {iso})...")
-        rc, checksum = run(["sha256sum", iso], capture=True)
-        checksum = checksum.split()[0]
+        checksum = _sha256(iso)
         run(["packer", "init", str(pkr_dir)])
         # -force so a leftover output dir from a previous failed/cancelled build
         # (packer/builds/<name>) is overwritten instead of aborting with
@@ -1405,7 +2039,9 @@ examples:
   setup.py build dc03                  (requires dc01 AND dc02 ready)
   setup.py build srv01 ws01 ws02       Build several members sequentially
   setup.py build all --parallel        Build everything, deps serialized
-  setup.py rebuild ws01 --force        Destroy + rebuild only ws01
+  setup.py rebuild ws01 --clean        Destroy + purge + clean metadata, rebuild
+  setup.py clean dc02                  Destroy + purge artifacts + clean AD/DNS
+  setup.py clean all --dry-run         Preview cleanup for every VM
   setup.py status                      Show the state table
   setup.py harden all --force          Strip vagrant creds (after builds)
   setup.py seal all --force            Single-home every VM (final step)
@@ -1423,6 +2059,11 @@ notes:
     last, and they require --force (or an interactive confirmation).
   * 'finalize' = harden + seal in the correct order, and also purges the stale
     10.0.2.* (NAT-leak) DNS records so names resolve on 192.168.200.x only.
+  * 'clean' removes rebuild blockers: VirtualBox leftovers (stale per-VM dirs,
+    orphaned temp-named VMs), .vagrant state, stale AD server+computer objects
+    and DNS A/PTR/SRV records. dc01's AD metadata is never removed (forest root).
+    It destroys the VM by default; --keep-vm/--ad-only clean metadata only,
+    --vbox-only skips AD, and --dry-run previews without changing anything.
 """
 
 
@@ -1491,6 +2132,9 @@ def build_parser():
                          help=f"Cap concurrent builds (default {DEFAULT_MAX_PARALLEL}).")
     p_build.add_argument("--force", action="store_true",
                          help="Allow (re)building a machine that is already built.")
+    p_build.add_argument("--clean", action="store_true",
+                         help="On --force/rebuild, also remove stale AD/DNS metadata "
+                              "for the VM before building it.")
     p_build.add_argument("--disable-av-update", action="store_true",
                          help="Also apply the domain GPO that disables Defender AV "
                               "+ Windows Update forest-wide (dc01 only).")
@@ -1508,6 +2152,9 @@ def build_parser():
     p_rebuild.add_argument("--max-parallel", type=positive_int,
                            default=DEFAULT_MAX_PARALLEL, metavar="N",
                            help=f"Cap concurrent builds (default {DEFAULT_MAX_PARALLEL}).")
+    p_rebuild.add_argument("--clean", action="store_true",
+                           help="Also remove stale AD/DNS metadata for the VM "
+                                "after destroying it (recommended for dc02/dc03).")
     p_rebuild.add_argument("--disable-av-update", action="store_true",
                            help="Also apply the Defender/Windows-Update disable GPO (dc01 only).")
     p_rebuild.set_defaults(func=_run_rebuild)
@@ -1540,6 +2187,11 @@ def build_parser():
     _add_vms_argument(p_seal)
     p_seal.add_argument("--force", action="store_true",
                         help="Skip the interactive confirmation.")
+    p_seal.add_argument("--shutdown-timeout", type=positive_int, default=120,
+                        metavar="N",
+                        help="Graceful ACPI shutdown wait in seconds (default 120).")
+    p_seal.add_argument("--no-graceful", action="store_true",
+                        help="Skip ACPI shutdown and power off immediately.")
     p_seal.set_defaults(func=_run_seal)
 
     # ── finalize ──
@@ -1555,6 +2207,11 @@ def build_parser():
                             help="Skip the interactive confirmation.")
     p_finalize.add_argument("--no-dns-clean", action="store_true",
                             help="Skip purging stale 10.0.2.* records from DC01's DNS.")
+    p_finalize.add_argument("--shutdown-timeout", type=positive_int, default=120,
+                            metavar="N",
+                            help="Graceful ACPI shutdown wait in seconds (default 120).")
+    p_finalize.add_argument("--no-graceful", action="store_true",
+                            help="Skip ACPI shutdown and power off immediately.")
     p_finalize.set_defaults(func=_run_finalize)
 
     # ── unseal ──
@@ -1563,7 +2220,39 @@ def build_parser():
         help="Re-add NAT nic1 -> restore Vagrant/WinRM/RDP.",
         description="Re-add the NAT nic1 to restore management access.")
     _add_vms_argument(p_unseal)
+    p_unseal.add_argument("--shutdown-timeout", type=positive_int, default=120,
+                          metavar="N",
+                          help="Graceful ACPI shutdown wait in seconds (default 120).")
+    p_unseal.add_argument("--no-graceful", action="store_true",
+                          help="Skip ACPI shutdown and power off immediately.")
     p_unseal.set_defaults(func=_run_unseal)
+
+    # ── clean ──
+    p_clean = sub.add_parser(
+        "clean", parents=[globals_parent],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="Destroy + purge artifacts + clean AD/DNS metadata (rebuild prep).",
+        description="Remove everything that blocks a clean rebuild:\n"
+                    "  1. destroy the VM if it exists (unless --keep-vm / --ad-only),\n"
+                    "  2. purge stale VirtualBox dirs / temp-named VMs / .vagrant state,\n"
+                    "  3. remove stale AD server+computer objects and DNS A/PTR/SRV records\n"
+                    "     (dc02/dc03 server objects, dc03 child-domain crossRef, etc.).\n"
+                    "dc01 is the forest root: its AD metadata is never removed here.\n"
+                    "Live VMs are never cleaned without destroying them first.")
+    _add_vms_argument(p_clean)
+    p_clean.add_argument("--force", action="store_true",
+                         help="Skip the interactive confirmation.")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="Report what would be removed; change nothing.")
+    modes = p_clean.add_mutually_exclusive_group()
+    modes.add_argument("--vbox-only", action="store_true",
+                       help="Only purge VirtualBox/Vagrant artifacts (no AD/DNS).")
+    modes.add_argument("--ad-only", action="store_true",
+                       help="Only clean AD/DNS metadata (do not destroy/purge the VM).")
+    p_clean.add_argument("--keep-vm", action="store_true",
+                         help="Do not destroy an existing VM; only purge leftovers "
+                              "and clean metadata for an already-destroyed VM.")
+    p_clean.set_defaults(func=_run_clean)
 
     # ── destroy ──
     p_destroy = sub.add_parser(
@@ -1573,6 +2262,9 @@ def build_parser():
     _add_vms_argument(p_destroy)
     p_destroy.add_argument("--force", action="store_true",
                            help="Skip the interactive confirmation.")
+    p_destroy.add_argument("--clean", action="store_true",
+                           help="Also purge VirtualBox/Vagrant leftovers and remove "
+                                "stale AD/DNS metadata (dc01 excluded).")
     p_destroy.set_defaults(func=_run_destroy)
 
     # ── build-boxes ──
@@ -1616,14 +2308,15 @@ def _run_build(args):
     global DISABLE_AV_UPDATE
     DISABLE_AV_UPDATE = getattr(args, "disable_av_update", False)
     return cmd_build(args.vms, force=args.force, parallel=args.parallel,
-                     max_parallel=args.max_parallel)
+                     max_parallel=args.max_parallel, clean=args.clean)
 
 
 def _run_rebuild(args):
     global DISABLE_AV_UPDATE
     DISABLE_AV_UPDATE = getattr(args, "disable_av_update", False)
     return cmd_build(args.vms, force=True, parallel=args.parallel,
-                     max_parallel=args.max_parallel, rebuild=True)
+                     max_parallel=args.max_parallel, rebuild=True,
+                     clean=args.clean)
 
 
 def _run_status(args):
@@ -1635,19 +2328,31 @@ def _run_harden(args):
 
 
 def _run_seal(args):
-    return cmd_seal(args.vms, force=args.force)
+    return cmd_seal(args.vms, force=args.force,
+                    shutdown_timeout=args.shutdown_timeout,
+                    no_graceful=args.no_graceful)
 
 
 def _run_finalize(args):
-    return cmd_finalize(args.vms, force=args.force, dns_clean=not args.no_dns_clean)
+    return cmd_finalize(args.vms, force=args.force,
+                        dns_clean=not args.no_dns_clean,
+                        shutdown_timeout=args.shutdown_timeout,
+                        no_graceful=args.no_graceful)
 
 
 def _run_unseal(args):
-    return cmd_unseal(args.vms)
+    return cmd_unseal(args.vms, shutdown_timeout=args.shutdown_timeout,
+                      no_graceful=args.no_graceful)
 
 
 def _run_destroy(args):
-    return cmd_destroy(args.vms, force=args.force)
+    return cmd_destroy(args.vms, force=args.force, clean=args.clean)
+
+
+def _run_clean(args):
+    return cmd_clean(args.vms, force=args.force, dry_run=args.dry_run,
+                     vbox_only=args.vbox_only, ad_only=args.ad_only,
+                     keep_vm=args.keep_vm)
 
 
 def _run_build_boxes(args):

@@ -30,8 +30,8 @@ foreach ($a in $adapters) {
     Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses "127.0.0.1",$dc01IP
     $ips = Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
     if ($ips.IPAddress -like "192.168.*") {
-        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $true
-        Write-Host "[dc03_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (registration ENABLED on internal $($ips.IPAddress))"
+        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -ConnectionSpecificSuffix $childDomain -RegisterThisConnectionsAddress $true
+        Write-Host "[dc03_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (registration ENABLED on internal $($ips.IPAddress), suffix $childDomain)"
     } else {
         Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
         Write-Host "[dc03_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (no dyn reg)"
@@ -40,6 +40,7 @@ foreach ($a in $adapters) {
 Clear-DnsClientCache
 
 Write-Host "[dc03_postboot] Forcing NLA re-detection (-> DomainAuthenticated)..."
+Set-DnsClientGlobalSetting -SuffixSearchList @($childDomain, $domain) -ErrorAction SilentlyContinue
 # CRITICAL for the child DC: if the internal NIC stays 'Public', the DC Locator
 # (DsGetDcName) fails with 1908 "could not find the domain controller for this
 # domain" and inbound Config/Schema replication from DC01 breaks. A plain
@@ -153,8 +154,12 @@ Get-DnsServerZone | Where-Object ZoneType -eq "Primary" | ForEach-Object {
 }
 
 Write-Host "[dc03_postboot] Disabling IPv6 DNS registration..."
+# Registry method (next boot), not a live unbind: the latter resets TCP on the
+# NAT adapter and can drop the WinRM session mid-postboot.
+$tcpip6 = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
+if (-not (Test-Path $tcpip6)) { New-Item -Path $tcpip6 -Force | Out-Null }
+Set-ItemProperty -Path $tcpip6 -Name 'DisabledComponents' -Value 0xFF -Type DWord -Force
 Get-NetAdapter | ForEach-Object {
-    Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
     $ips = Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
     if ($ips.IPAddress -like "192.168.*") {
         Set-DnsClient -InterfaceIndex $_.InterfaceIndex -RegisterThisConnectionsAddress $true -ErrorAction SilentlyContinue

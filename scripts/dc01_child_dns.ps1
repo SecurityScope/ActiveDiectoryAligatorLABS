@@ -53,5 +53,22 @@ if ($existingFwd -and $existingFwd.ZoneType -eq "Forwarder") {
     }
 }
 
+# The dc01_dns.ps1 inventory A record for dc03 lives in the parent zone. A
+# rebuild's pre-promotion cleanup can remove it; re-add it so the lab inventory
+# name dc03.secscope.corp resolves to the child DC (its own FQDN is
+# dc03.it.secscope.corp and lives in the child zone).
+Write-Host "[dc01_child_dns] Ensuring parent-zone dc03 A record..."
+try {
+    $existingA = Get-DnsServerResourceRecord -ZoneName $domain -Name "dc03" -RRType A -ErrorAction SilentlyContinue
+    if (-not $existingA) {
+        Add-DnsServerResourceRecordA -Name "dc03" -ZoneName $domain -IPv4Address $dc03IP -ErrorAction Stop
+        Write-Host "[dc01_child_dns] Added dc03.$domain -> $dc03IP"
+    } else {
+        Write-Host "[dc01_child_dns] dc03.$domain A record already present"
+    }
+} catch {
+    Write-Host "[dc01_child_dns] Could not add dc03 A record: $_"
+}
+
 Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
 Write-Host "[dc01_child_dns] Parent-side child DNS configuration complete"

@@ -18,14 +18,33 @@ if ($env:COMPUTERNAME -eq $dcName) {
 
 Write-Host "[$logPrefix] Setting static IP $dcIP on secondary adapter..."
 $adapters = Get-NetAdapter | Where-Object Status -eq 'Up'
-$mgmtNic  = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).InterfaceIndex
-$nic2     = $adapters | Where-Object { $_.InterfaceIndex -ne $mgmtNic } | Select-Object -First 1
+
+# Identify the NAT/management adapter by its VirtualBox NAT address (10.0.2.x),
+# NOT by "whichever default route is first". After an earlier run the internal
+# adapter can own a default route (192.168.200.1), which made the old logic pick
+# the NAT adapter as "secondary" and reconfigure it - instantly cutting WinRM.
+$mgmtNic = $null
+foreach ($a in $adapters) {
+    $aip = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    if ($aip -like '10.0.2.*') { $mgmtNic = $a.InterfaceIndex; break }
+}
+if (-not $mgmtNic) {
+    # Fallback for a NAT adapter that is still DHCP/APIPA at this point.
+    $mgmtNic = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).InterfaceIndex
+}
+$nic2 = $adapters | Where-Object { $_.InterfaceIndex -ne $mgmtNic } | Select-Object -First 1
 
 if ($nic2) {
     $ifIndex = $nic2.InterfaceIndex
     $nic2Name = $nic2.Name
     Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    netsh interface ip set address name="$nic2Name" static $dcIP 255.255.255.0 192.168.200.1
+    # NO default gateway on the internal (natnetwork) adapter. Giving it one -
+    # combined with the lower interface metric below - installs a default route
+    # that outranks the NAT adapter's route. That hijacks the return path of the
+    # WinRM session (which rides nic1/NAT) and disconnects Vagrant mid-provision.
+    # All lab traffic is on 192.168.200.0/24, so the internal adapter needs only
+    # its on-link /24 route.
+    netsh interface ip set address name="$nic2Name" static $dcIP 255.255.255.0
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled
     # Internal (natnetwork) adapter must register its connection address so
@@ -53,22 +72,26 @@ if ($nic2) {
         }
     }
     Write-Host "[$logPrefix] Static IP set, DNS pointing to $dnsServer"
-    Write-Host "[$logPrefix] Waiting for network profile..."
-    for ($j = 1; $j -le 8; $j++) {
-        try {
+    # Best-effort, single attempt - and never on a NoTraffic profile. The static
+    # IP was just applied but NLA may not have observed traffic yet; calling
+    # Set-NetConnectionProfile on a NoTraffic profile can block inside NLA/WMI.
+    # The NLA-Recheck startup task reclassifies the adapter after base-reload.
+    try {
+        $prof = Get-NetConnectionProfile -InterfaceAlias $nic2Name -ErrorAction Stop
+        if ($prof.IPv4Connectivity -ne 'NoTraffic') {
             Set-NetConnectionProfile -InterfaceAlias $nic2Name -NetworkCategory Private -ErrorAction Stop
             Write-Host "[$logPrefix] Network profile set to Private"
-            break
-        } catch {
-            Write-Host "[$logPrefix] Profile not ready, retrying ($j/8)..."
-            Start-Sleep 3
+        } else {
+            Write-Host "[$logPrefix] Network profile deferred (NoTraffic) to NLA-Recheck"
         }
+    } catch {
+        Write-Host "[$logPrefix] Network profile deferred to NLA-Recheck startup task: $_"
     }
 } else {
     Write-Host "[$logPrefix] WARNING: Could not find secondary adapter"
     $idx = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceIndex
     $nicName = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name
-    netsh interface ip set address name="$nicName" static $dcIP 255.255.255.0 192.168.200.1
+    netsh interface ip set address name="$nicName" static $dcIP 255.255.255.0
     Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsServer
     Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled
     Set-DnsClient -InterfaceIndex $idx -ConnectionSpecificSuffix $dnsSuffix -RegisterThisConnectionsAddress $false

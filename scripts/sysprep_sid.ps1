@@ -31,6 +31,12 @@ $unattend = @"
                     <CommandLine>cmd /c "sc config WinRM start= auto &amp; net start WinRM &amp; winrm set winrm/config/service @{AllowUnencrypted="true"} &amp; winrm set winrm/config/service/auth @{Basic="true"} &amp; netsh advfirewall set allprofiles state off"</CommandLine>
                     <Order>1</Order>
                 </SynchronousCommand>
+                <!-- Marker for setup.py: proves generalize+OOBE completed, so a
+                     resumed build does not run sysprep a second time. -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd /c echo done &gt; C:\Windows\Temp\lab_sysprep.done</CommandLine>
+                    <Order>2</Order>
+                </SynchronousCommand>
             </FirstLogonCommands>
         </component>
     </settings>

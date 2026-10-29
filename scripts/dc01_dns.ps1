@@ -153,11 +153,16 @@ Write-Host "[dc01_dns] Forcing NLA re-detection (Private -> DomainAuthenticated)
 # "Private", never re-checking on its own. Set-NetConnectionProfile cannot set
 # DomainAuthenticated (that category is auto-assigned by NLA only). Bouncing
 # the internal adapter forces a fresh NLA discovery now that AD/DNS are up.
+# An empty ConnectionSpecificSuffix makes the adapter "Unidentified", so pin the
+# suffix/suffix-search list first; then NLA can associate the NIC with the domain.
 # WinRM runs over the NAT adapter, so this does not drop the session.
 $internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {
     (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*"
 } | Select-Object -First 1
 if ($internal) {
+    Set-DnsClient -InterfaceIndex $internal.InterfaceIndex -ConnectionSpecificSuffix $domain -RegisterThisConnectionsAddress $true -ErrorAction SilentlyContinue
+    Set-DnsClientGlobalSetting -SuffixSearchList @($domain, "secscope.corp") -ErrorAction SilentlyContinue
+    nltest /dsgetdc:$domain 2>&1 | Out-Null
     Restart-NetAdapter -Name $internal.Name -Confirm:$false -ErrorAction SilentlyContinue
     Start-Sleep 8
     $cat = (Get-NetConnectionProfile -InterfaceAlias $internal.Name -ErrorAction SilentlyContinue).NetworkCategory
@@ -218,7 +223,7 @@ try {
     # AD-integrated zones refuse AXFR by default. Allow transfer to any server so
     # the Network Recon module's 'dig axfr $domain @dc01' / fierce / dnsrecon
     # zone-transfer exercise actually dumps the zone.
-    Set-DnsServerPrimaryZone -Name $domain -SecureSecondaries TransferToAnyServer -ErrorAction Stop
+    Set-DnsServerPrimaryZone -Name $domain -SecureSecondaries TransferAnyServer -ErrorAction Stop
     Write-Host "[dc01_dns] Zone transfer enabled on $domain (AXFR to any server)"
 } catch {
     Write-Host "[dc01_dns] Could not enable zone transfer (may already be set): $_"

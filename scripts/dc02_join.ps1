@@ -28,7 +28,9 @@ if ($dcIP) {
         if ($curr -ne $dcIP) {
             Write-Host "[dc02_join] Internal adapter '$($intf.Name)' is '$curr'; setting static $dcIP"
             Get-NetIPAddress -InterfaceIndex $intf.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-            netsh interface ip set address name="$($intf.Name)" static $dcIP 255.255.255.0 192.168.200.1 | Out-Null
+            # No default gateway: the internal adapter must not outrank the NAT
+            # adapter's default route (WinRM rides the NAT adapter).
+            netsh interface ip set address name="$($intf.Name)" static $dcIP 255.255.255.0 | Out-Null
             Set-NetIPInterface -InterfaceIndex $intf.InterfaceIndex -Dhcp Disabled -ErrorAction SilentlyContinue
             Set-DnsClientServerAddress -InterfaceIndex $intf.InterfaceIndex -ServerAddresses $dc01IP -ErrorAction SilentlyContinue
             Start-Sleep 3
@@ -169,8 +171,12 @@ Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service ADWS -ErrorAction SilentlyContinue
 
 Write-Host "[dc02_join] Disabling IPv6 DNS registration..."
+# Registry method (next boot), not a live unbind: the latter resets TCP and can
+# cut the connection the post-promotion DNS steps rely on.
+$tcpip6 = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
+if (-not (Test-Path $tcpip6)) { New-Item -Path $tcpip6 -Force | Out-Null }
+Set-ItemProperty -Path $tcpip6 -Name 'DisabledComponents' -Value 0xFF -Type DWord -Force
 Get-NetAdapter | ForEach-Object {
-    Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
     # Keep IPv4 connection registration on the internal (192.168.x) adapter so
     # Netlogon can publish DC02's DC-locator SRV records; only disable it on
     # the NAT adapter to keep its WAN IP out of the AD DNS zones.

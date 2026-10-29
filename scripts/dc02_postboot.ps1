@@ -18,8 +18,8 @@ foreach ($a in $adapters) {
     # (10.0.2.x) so its WAN IP never pollutes the AD DNS zones.
     $ip = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
     if ($ip -like "192.168.*") {
-        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $true
-        Write-Host "[dc02_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (registration ENABLED, internal $ip)"
+        Set-DnsClient -InterfaceIndex $a.InterfaceIndex -ConnectionSpecificSuffix $domain -RegisterThisConnectionsAddress $true
+        Write-Host "[dc02_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (registration ENABLED, internal $ip, suffix $domain)"
     } else {
         Set-DnsClient -InterfaceIndex $a.InterfaceIndex -RegisterThisConnectionsAddress $false
         Write-Host "[dc02_postboot] DNS on $($a.Name) -> 127.0.0.1,$dc01IP (no dyn reg, $ip)"
@@ -36,6 +36,7 @@ Clear-DnsClientCache
 # which replicates to DC02 automatically - no per-server forwarder needed.
 
 Write-Host "[dc02_postboot] Forcing NLA re-detection (Private -> DomainAuthenticated)..."
+Set-DnsClientGlobalSetting -SuffixSearchList @($domain, "secscope.corp") -ErrorAction SilentlyContinue
 $internal = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Where-Object {
     (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -like "192.168.*"
 } | Select-Object -First 1

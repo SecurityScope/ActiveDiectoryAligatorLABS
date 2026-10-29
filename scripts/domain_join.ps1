@@ -31,7 +31,9 @@ if ($nic2) {
     $ifIndex = $nic2.InterfaceIndex
     $nic2Name = $nic2.Name
     Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    netsh interface ip set address name="$nic2Name" static $vmIP 255.255.255.0 192.168.200.1
+    # No default gateway on the internal adapter: it must not outrank the NAT
+    # adapter's default route, which carries WinRM during this provisioner.
+    netsh interface ip set address name="$nic2Name" static $vmIP 255.255.255.0
     Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dc01IP
     Set-NetIPInterface -InterfaceIndex $ifIndex -Dhcp Disabled -ErrorAction SilentlyContinue
     Set-NetIPInterface -InterfaceIndex $ifIndex -InterfaceMetric 10 -ErrorAction SilentlyContinue
@@ -60,7 +62,7 @@ if ($nic2) {
     Write-Host "[$logPrefix] WARNING: Could not find secondary adapter"
     $idx = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).InterfaceIndex
     $idxName = (Get-NetAdapter -InterfaceIndex $idx).Name
-    netsh interface ip set address name="$idxName" static $vmIP 255.255.255.0 192.168.200.1
+    netsh interface ip set address name="$idxName" static $vmIP 255.255.255.0
     Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dc01IP
     Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -ErrorAction SilentlyContinue
     $ifIndex = $idx

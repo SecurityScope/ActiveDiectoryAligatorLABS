@@ -9,86 +9,84 @@ $dsrmPass    = $env:DSRM_PASS
 Write-Host "[dc01_postboot] Installing AD-Domain-Services, DNS, RSAT..."
 Install-WindowsFeature -Name AD-Domain-Services, DNS, RSAT-AD-PowerShell -IncludeManagementTools
 
-Write-Host "[dc01_postboot] Waiting for ADWS before domain check..."
-$adwsReady = $false
-for ($i = 1; $i -le 12; $i++) {
-    try {
-        $status = (Get-Service ADWS -ErrorAction Stop).Status
-        if ($status -eq "Running") { $adwsReady = $true; break }
-    } catch {}
-    Start-Sleep 5
-}
-if ($adwsReady) {
+# Idempotent resume: if the forest already exists (e.g. an earlier run was
+# interrupted after promotion), skip re-promotion.
+try {
+    $null = Get-ADDomain -ErrorAction Stop
+    Write-Host "[dc01_postboot] Domain $domain already exists, skipping promotion"
+    exit 0
+} catch {}
+
+# ── Why the promotion is launched as a scheduled task ───────────────────────
+# Install-ADDSForest replaces the local SAM while it runs. That invalidates the
+# WinRM session that is executing this provisioner: ~60-90s in, Vagrant gets a
+# 401 ("An authorization error occurred while connecting to WinRM"). Previously
+# the detached process happened to survive long enough on a warmed-up box, but
+# on a fresh box setup.py saw the 401, force-reloaded the VM, and killed the
+# promotion mid-flight (leaving a half-promoted DC that never boots).
+#
+# Running the promotion under a one-shot SYSTEM scheduled task removes that
+# dependency entirely: the task keeps running after WinRM auth is lost, writes
+# the result, then reboots the guest itself. setup.py waits for AD to come back
+# instead of reloading.
+Write-Host "[dc01_postboot] Preparing detached forest promotion..."
+
+$innerScriptPath = "C:\Windows\Temp\dc01_addsforest.ps1"
+$logPath         = "C:\Windows\Temp\dc01_addsforest.out.log"
+$errPath         = "C:\Windows\Temp\dc01_addsforest.err.log"
+$donePath        = "C:\Windows\Temp\dc01_addsforest.done"
+$taskName        = "DC01-ADDSForest"
+
+Remove-Item $logPath,$errPath,$donePath -ErrorAction SilentlyContinue
+
+# The Install-ADDSForest call stays on ONE line. A prior bug combined CRLF line
+# endings with backtick continuation and split the cmdlet into parameterless
+# statements, which blocked forever on the missing mandatory -DomainName.
+$innerScript = @'
+$ProgressPreference    = 'SilentlyContinue'
+$WarningPreference     = 'SilentlyContinue'
+$ConfirmPreference     = 'None'
+$ErrorActionPreference = 'Stop'
+$log  = 'C:\Windows\Temp\dc01_addsforest.out.log'
+$err  = 'C:\Windows\Temp\dc01_addsforest.err.log'
+$done = 'C:\Windows\Temp\dc01_addsforest.done'
+try {
+    # Another attempt (or a resumed build) may already have promoted this box.
     try {
         $null = Get-ADDomain -ErrorAction Stop
-        Write-Host "[dc01_postboot] Domain $domain already exists, skipping promotion"
+        'already-promoted' | Set-Content -Path $done -Encoding ASCII
         exit 0
     } catch {}
+    Import-Module ADDSDeployment
+    $dsrmSec = ConvertTo-SecureString '__DSRM_PASS__' -AsPlainText -Force
+    Install-ADDSForest -DomainName '__DOMAIN__' -SafeModeAdministratorPassword $dsrmSec -DomainNetbiosName '__DOMAIN_UPPER__' -InstallDns:$true -CreateDnsDelegation:$false -Force -Confirm:$false -NoRebootOnCompletion:$true -ErrorAction Stop *>&1 | Tee-Object -FilePath $log
+    'ok' | Set-Content -Path $done -Encoding ASCII
+    Restart-Computer -Force
+} catch {
+    ($_ | Out-String) | Set-Content -Path $err -Encoding UTF8
+    ('failed: ' + $_) | Add-Content -Path $log
+    'failed' | Set-Content -Path $done -Encoding ASCII
+    exit 1
 }
+'@
 
-Write-Host "[dc01_postboot] Promoting to Domain Controller ($domain)..."
+$innerScript = $innerScript.Replace('__DSRM_PASS__', $dsrmPass).Replace('__DOMAIN__', $domain).Replace('__DOMAIN_UPPER__', $domainUpper)
+Set-Content -Path $innerScriptPath -Value $innerScript -Encoding UTF8
 
-# Run Install-ADDSForest in a genuinely detached process (Start-Process),
-# NOT a PowerShell background job, and with every parameter on a single
-# line (no backtick line-continuation). A prior bug in this file combined
-# CRLF line endings with backtick continuation, which silently split the
-# Install-ADDSForest call into multiple statements - the cmdlet then ran
-# with none of its parameters, and PowerShell blocked forever prompting
-# (non-interactively, so it could never be answered) for the missing
-# mandatory -DomainName value. Keeping this as a single line avoids that
-# entire class of bug regardless of file line-ending handling.
-$innerScriptPath = "C:\Windows\Temp\dc01_addsforest.ps1"
-$innerLines = @(
-    '$ProgressPreference = ''SilentlyContinue''',
-    '$WarningPreference = ''SilentlyContinue''',
-    '$ConfirmPreference = ''None''',
-    'Import-Module ADDSDeployment',
-    ('$dsrmSec = ConvertTo-SecureString ' + "'" + $dsrmPass + "'" + ' -AsPlainText -Force'),
-    ('Install-ADDSForest -DomainName ' + "'" + $domain + "'" + ' -SafeModeAdministratorPassword $dsrmSec -DomainNetbiosName ' + "'" + $domainUpper + "'" + ' -InstallDns:$true -CreateDnsDelegation:$false -Force -Confirm:$false -NoRebootOnCompletion:$true -ErrorAction Stop')
-)
-Set-Content -Path $innerScriptPath -Value $innerLines -Encoding UTF8
-
-$stdout = "C:\Windows\Temp\dc01_addsforest.out.log"
-$stderr = "C:\Windows\Temp\dc01_addsforest.err.log"
-$stdin  = "C:\Windows\Temp\dc01_addsforest.in.txt"
-Remove-Item $stdout,$stderr,$stdin -ErrorAction SilentlyContinue
-Set-Content -Path $stdin -Value "" -Encoding ASCII
-
-$startArgs = @{
-    FilePath               = "powershell.exe"
-    ArgumentList           = @("-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $innerScriptPath)
-    RedirectStandardInput  = $stdin
-    RedirectStandardOutput = $stdout
-    RedirectStandardError  = $stderr
-    WindowStyle            = "Hidden"
-    PassThru               = $true
-}
-$proc = Start-Process @startArgs
-
-$finished = Wait-Process -Id $proc.Id -Timeout 240 -ErrorAction SilentlyContinue
-if (-not $finished -and -not $proc.HasExited) {
-    Write-Host "[dc01_postboot] ERROR: Install-ADDSForest timed out after 240s (hung). Killing process."
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    Get-Content $stdout,$stderr -ErrorAction SilentlyContinue | Write-Host
+$action = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File $innerScriptPath"
+schtasks.exe /create /tn $taskName /tr $action /sc ONCE /st 23:59 /ru SYSTEM /rl HIGHEST /f 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[dc01_postboot] ERROR: could not register scheduled task '$taskName' (rc=$LASTEXITCODE)."
+    schtasks.exe /create /tn $taskName /tr $action /sc ONCE /st 23:59 /ru SYSTEM /rl HIGHEST /f 2>&1 | Write-Host
     exit 1
 }
 
-Get-Content $stdout -ErrorAction SilentlyContinue | Write-Host
-$errContent = Get-Content $stderr -ErrorAction SilentlyContinue
-if ($errContent) {
-    Write-Host "[dc01_postboot] STDERR:"
-    $errContent | Write-Host
-}
-$okExit = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3 -or [string]::IsNullOrEmpty("$($proc.ExitCode)"))
-if (-not $okExit) {
-    if ($errContent -match "Name change pending") {
-        Write-Host "[dc01_postboot] ERROR: Computer rename has not been applied (reboot missing)."
-        Write-Host "[dc01_postboot] Run 'vagrant reload dc01 --force' first, then retry this provisioner."
-    }
-    Write-Host "[dc01_postboot] ERROR: Install-ADDSForest exited with code $($proc.ExitCode)"
+schtasks.exe /run /tn $taskName 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[dc01_postboot] ERROR: could not start scheduled task '$taskName' (rc=$LASTEXITCODE)."
     exit 1
 }
-Write-Host "[dc01_postboot] Install-ADDSForest exited with code $($proc.ExitCode) (0=success, 3=reboot required)"
 
-Write-Host "[dc01_postboot] Forest install completed. Reboot required (vagrant reload dc01)."
-Remove-Item $innerScriptPath -ErrorAction SilentlyContinue
+Write-Host "[dc01_postboot] Promotion launched as scheduled task '$taskName'."
+Write-Host "[dc01_postboot] Exiting now: WinRM will drop while the local SAM is replaced, then the guest reboots."
+exit 0
